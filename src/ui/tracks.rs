@@ -696,11 +696,11 @@ fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>, covers: bool)
             s.play_tracks(list.to_vec(), start);
         })
         .on_secondary_press({
-            // Right-click opens the same menu as the "…" button, anchored to that button.
+            // Right-click opens the same menu as the "…" button, at the pointer.
             let menu = row_menu.clone();
             let key = menu_key.clone();
-            move |s: &mut Ui, _: rune::PointerPress, _: &mut rune::Tx| {
-                s.open_menu(MenuState::track(key.clone(), menu.clone()))
+            move |s: &mut Ui, press: rune::PointerPress, _: &mut rune::Tx| {
+                s.open_menu(MenuState::track(key.clone(), menu.clone()).at(press))
             }
         })
         .child(number_cell(s, p, index, track, rows));

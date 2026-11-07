@@ -352,8 +352,8 @@ fn short_row(s: &Ui, p: Palette, track: &Track, index: usize) -> El {
             let start = crate::ui::tracks::row_of(&list, id, index).unwrap_or(index);
             s.play_tracks(list, start);
         })
-        .on_secondary_press(move |s: &mut Ui, _: rune::PointerPress, _: &mut rune::Tx| {
-            s.open_menu(MenuState::track(click_key.clone(), click_menu.clone()))
+        .on_secondary_press(move |s: &mut Ui, press: rune::PointerPress, _: &mut rune::Tx| {
+            s.open_menu(MenuState::track(click_key.clone(), click_menu.clone()).at(press))
         })
         .child(cover_art(s, p, track.cover.as_deref(), Some(48.0)))
         .child(

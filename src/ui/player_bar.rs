@@ -94,9 +94,11 @@ fn now_playing_area(s: &Ui, p: Palette, playing: Option<&crate::app::NowPlaying>
     }
     let album = playing.map(|track| track.album.clone()).unwrap_or_default();
 
+    // Only as wide as its text (up to a cap), so the heart that follows sits right beside the
+    // title; growing here pushed the heart to the far end of the now-playing block.
     let info = col()
-        .grow(1.0)
         .min_w(0.0)
+        .max_w(360.0)
         .gap(3.0)
         .child(title_el)
         .child(artist_el)
@@ -750,5 +752,29 @@ mod centring_tests {
             let (x, _) = rt.find("transport").expect("play/pause button");
             assert!((x - width / 2.0).abs() < 1.5, "width {width}: play/pause at {x}, window centre {}", width / 2.0);
         }
+    }
+
+    /// The like button follows the title and artist closely instead of drifting to the far end
+    /// of the now-playing block on a wide window.
+    #[test]
+    fn the_heart_sits_beside_the_track_info() {
+        let mut s = init();
+        s.now_playing = Some(NowPlaying {
+            id: 7,
+            title: "Short".to_owned(),
+            artist: "Artist".to_owned(),
+            album: "Album".to_owned(),
+            cover: None,
+            album_id: None,
+            artist_id: None,
+            elapsed: 6,
+            duration: Some(180),
+            quality: None,
+            output: None,
+        });
+        let mut rt = rune::Runtime::new(s, bar_view, (1920.0, 84.0), rune::Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, _) = rt.find("player-heart").expect("the like button");
+        assert!(x < 260.0, "heart at x = {x} on a 1920pt bar: it belongs next to the title");
     }
 }

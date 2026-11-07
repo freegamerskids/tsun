@@ -221,8 +221,8 @@ fn compact_track(
         .grow(1.0).min_w(0.0).h(62.0).px(7.0).gap(12.0).center_y()
         .radius(4.0).hover(p.card).focusable(true)
         .on_press(move |s: &mut Ui| s.play_id(id))
-        .on_secondary_press(move |s: &mut Ui, _: rune::PointerPress, _: &mut rune::Tx| {
-            s.open_menu(MenuState::track(menu_key_for_click.clone(), menu_for_click.clone()))
+        .on_secondary_press(move |s: &mut Ui, press: rune::PointerPress, _: &mut rune::Tx| {
+            s.open_menu(MenuState::track(menu_key_for_click.clone(), menu_for_click.clone()).at(press))
         })
         .child(cover_art(s, p, track.cover.as_deref(), Some(48.0)))
         .child(col().grow(1.0).min_w(0.0).gap(4.0)

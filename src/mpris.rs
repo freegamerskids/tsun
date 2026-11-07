@@ -33,6 +33,17 @@
 //! session bus is available `start` returns `Err` and the application should
 //! simply carry on without MPRIS. Dropping the handle releases the bus name.
 //!
+//! # The play/pause fast path
+//!
+//! By default every method call (play, pause, next, seek, …) is delivered as an
+//! [`MprisCommand`] on the channel passed to [`Mpris::start`], so the
+//! application applies it when its loop next runs. That loop can be stalled for
+//! a long time — a covered or hidden Wayland window gets no frame callbacks —
+//! so [`Mpris::set_transport_sink`] lets play/pause bypass it and reach the
+//! player directly. Next/previous still need the play queue, and stop, seek and
+//! volume still need the application's own state, so those keep using the
+//! channel.
+//!
 //! # Position
 //!
 //! MPRIS defines `Position` as read-only and excludes it from
@@ -90,6 +101,29 @@ pub enum MprisPlayback {
     Stopped,
 }
 
+/// A play/pause request that can go straight to the player thread, without waiting for the
+/// application's UI loop to run a frame: a window that is hidden or covered by a Wayland
+/// compositor gets no frame callbacks, and meta keys must still work then.
+///
+/// Everything that needs the play queue (next/previous) and everything that changes the UI's
+/// own state (seek, volume, stop, quit) still goes through [`MprisCommand`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MprisTransport {
+    Play,
+    Pause,
+    PlayPause,
+}
+
+/// The fast-path request a command maps to, if any.
+fn transport_for(command: &MprisCommand) -> Option<MprisTransport> {
+    match command {
+        MprisCommand::Play => Some(MprisTransport::Play),
+        MprisCommand::Pause => Some(MprisTransport::Pause),
+        MprisCommand::PlayPause => Some(MprisTransport::PlayPause),
+        _ => None,
+    }
+}
+
 impl MprisPlayback {
     fn as_str(self) -> &'static str {
         match self {
@@ -133,6 +167,9 @@ struct Shared {
     props: Mutex<Props>,
     /// Wrapped in a `Mutex` so the handle (and `Shared`) can be `Sync`.
     command_tx: Mutex<Sender<MprisCommand>>,
+    /// When set, play/pause is delivered here instead of through `command_tx`, so a media key
+    /// acts on the player even while the application's UI loop is stalled with its window.
+    transport_tx: Mutex<Option<Sender<MprisTransport>>>,
 }
 
 impl Shared {
@@ -142,12 +179,28 @@ impl Shared {
         Shared {
             props: Mutex::new(props),
             command_tx: Mutex::new(command_tx),
+            transport_tx: Mutex::new(None),
         }
     }
 
     fn send(&self, command: MprisCommand) {
+        if let Some(transport) = transport_for(&command) {
+            if let Ok(mut slot) = self.transport_tx.lock() {
+                if let Some(tx) = slot.as_mut() {
+                    let _ = tx.send(transport);
+                    return;
+                }
+            }
+        }
         if let Ok(tx) = self.command_tx.lock() {
             let _ = tx.send(command);
+        }
+    }
+
+    /// Installs the fast path play/pause takes; without one every command rides `command_tx`.
+    fn set_transport(&self, tx: Sender<MprisTransport>) {
+        if let Ok(mut slot) = self.transport_tx.lock() {
+            *slot = Some(tx);
         }
     }
 
@@ -436,6 +489,14 @@ impl Mpris {
             .build()
             .map_err(|error| format!("could not register {BUS_NAME} on the session bus: {error}"))?;
         Ok(Mpris { shared, connection })
+    }
+
+    /// Routes play/pause straight to the player thread instead of the command channel, so a
+    /// media key works even when the application's window is not being drawn (and its poll loop
+    /// is therefore not running). Without it every command rides the channel passed to
+    /// [`Mpris::start`].
+    pub fn set_transport_sink(&self, tx: Sender<MprisTransport>) {
+        self.shared.set_transport(tx);
     }
 
     /// Reports a new playback status and signals the change.

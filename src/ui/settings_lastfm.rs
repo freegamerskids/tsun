@@ -7,72 +7,105 @@
 //! in the browser, "I've authorized" exchanges it for a session, and the switches are handed to
 //! the scrobble thread where they gate what is sent.
 
-use rune::{Color, El, TextStyle, Tx, col, el, icon, row, text, text_input};
+use rune::{El, TextStyle, Tx, col, row, text, text_input};
 
 use crate::app::{Notice, Ui};
 use crate::lastfm::{Connection, LastFmPref};
-use crate::theme::{BODY, CAPS, ICON_CHECK, SMALL, TRACK, Palette};
+use crate::theme::{SMALL, Palette};
+use crate::ui::settings_widgets::{self as w, Tone};
 use crate::widgets::{primary_button, secondary_button};
 
 /// The Last.fm card.
 pub(crate) fn lastfm_card(s: &Ui, p: Palette) -> El {
     let Some(lastfm) = &s.lastfm else { return col() };
-    let mut card = card(p)
+    let (tone, label, hint) = match &lastfm.conn {
+        Connection::Connected { username } => (
+            Tone::Ok,
+            format!("Connected as {username}"),
+            "Every play past the threshold is scrobbled from here.",
+        ),
+        Connection::Authorizing { .. } => (
+            Tone::Warn,
+            "Waiting for authorization".to_owned(),
+            "Approve tsun in the browser page Last.fm opened, then confirm below.",
+        ),
+        Connection::Disconnected => (
+            Tone::Off,
+            "Not connected".to_owned(),
+            "Add your own Last.fm API key and shared secret, then press Connect.",
+        ),
+    };
+    let mut card = w::card(p)
         .key("lastfm-card")
-        .child(section("Last.fm scrobbling", p))
         .child(
-            text(
-                "Scrobbles what you play to your Last.fm account. tsun ships no API key: register \
-                 an application at last.fm/api/account/create and paste its API key and shared \
-                 secret here. They are stored in lastfm.json (0600), never in settings.json.",
-            )
-            .font(SMALL)
-            .color(p.faint)
-            .wrap_anywhere(),
+            row().w_full().padding(14.0).child(w::card_header(
+                p,
+                "Last.fm scrobbling",
+                "Send what you play to your Last.fm account.",
+                Some(w::status_badge(p, tone, &label).key("lastfm-status")),
+            )),
+        )
+        .child(
+            row()
+                .w_full()
+                .px(14.0)
+                .pb(12.0)
+                .child(w::note(w::tone_color(tone, p), hint)),
         );
     match &lastfm.conn {
-        Connection::Connected { username } => {
+        Connection::Connected { .. } => {
             card = card
-                .child(status_row(p, p.accent, format!("Connected as {username}"), "Every play past the threshold is scrobbled from here."))
-                .child(toggle_row(
+                .child(w::divider(p))
+                .child(w::toggle_row(
                     p,
                     "lastfm-scrobble",
                     "Scrobble",
-                    "Send plays once they pass half the track or four minutes.",
+                    Some("Send plays once they pass half the track or four minutes."),
                     lastfm.scrobble,
                     |s: &mut Ui| s.lastfm_set_pref(LastFmPref::Scrobble),
                 ))
-                .child(toggle_row(
+                .child(w::divider(p))
+                .child(w::toggle_row(
                     p,
                     "lastfm-now-playing",
                     "Send now playing",
-                    "Tell Last.fm what is playing as soon as a track starts.",
+                    Some("Tell Last.fm what is playing as soon as a track starts."),
                     lastfm.now_playing,
                     |s: &mut Ui| s.lastfm_set_pref(LastFmPref::NowPlaying),
                 ))
-                .child(toggle_row(
+                .child(w::divider(p))
+                .child(w::toggle_row(
                     p,
                     "lastfm-love",
-                    "Love tracks on Last.fm when I favourite them on TIDAL",
-                    "Mirrors the heart: a TIDAL favourite loves the track, removing it un-loves it. Local files have no TIDAL favourite, so they are never loved.",
+                    "Love tracks when I favourite them on TIDAL",
+                    Some("Mirrors the heart: a TIDAL favourite loves the track, removing it un-loves it. Local files have no TIDAL favourite, so they are never loved."),
                     lastfm.love,
                     |s: &mut Ui| s.lastfm_set_pref(LastFmPref::Love),
                 ))
+                .child(w::divider(p))
                 .child(
-                    row().pt(4.0)
-                        .child(secondary_button(p, "Disconnect", true, |s: &mut Ui, _: &mut rune::Tx| {
-                            s.lastfm_disconnect()
-                        })),
+                    row().w_full().padding(14.0).justify_end().child(secondary_button(
+                        p,
+                        "Disconnect",
+                        true,
+                        |s: &mut Ui, _: &mut rune::Tx| s.lastfm_disconnect(),
+                    )),
                 );
         }
         Connection::Authorizing { url } => {
             let open = url.clone();
             let copy = url.clone();
             card = card
-                .child(status_row(p, p.dim, "Waiting for authorization".to_owned(), "Your browser opens Last.fm's authorization page; approve tsun there, then confirm below."))
-                .child(link_card(url, p))
+                .child(w::divider(p))
+                .child(col().w_full().padding(14.0).gap(12.0).child(link_card(url, p)))
                 .child(
-                    row().gap(10.0).center_y()
+                    row()
+                        .w_full()
+                        .px(14.0)
+                        .pb(14.0)
+                        .gap(10.0)
+                        .center_y()
+                        .justify_end()
                         .child(primary_button(p, "Open authorization page", true, move |s: &mut Ui, tx: &mut Tx| {
                             if let Err(error) = tx.open_url(&open) {
                                 s.notice = Some(Notice::error(format!("Couldn't open the link: {error}")));
@@ -91,18 +124,32 @@ pub(crate) fn lastfm_card(s: &Ui, p: Palette) -> El {
         }
         Connection::Disconnected => {
             card = card
-                .child(key_field(s, p))
-                .child(secret_field(s, p))
+                .child(w::divider(p))
                 .child(
-                    row().pt(4.0).gap(10.0).center_y()
-                        .child(primary_button(p, "Connect", true, |s: &mut Ui, _: &mut rune::Tx| {
-                            s.lastfm_connect()
-                        }))
+                    col()
+                        .w_full()
+                        .padding(14.0)
+                        .gap(16.0)
+                        .child(key_field(s, p))
+                        .child(secret_field(s, p)),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .px(14.0)
+                        .pb(14.0)
+                        .gap(12.0)
+                        .center_y()
+                        .justify_end()
                         .child(
                             text("Connect opens Last.fm in your browser to authorize this app.")
                                 .font(SMALL)
-                                .color(p.faint),
-                        ),
+                                .color(p.faint)
+                                .wrap(),
+                        )
+                        .child(primary_button(p, "Connect", true, |s: &mut Ui, _: &mut rune::Tx| {
+                            s.lastfm_connect()
+                        })),
                 );
         }
     }
@@ -111,7 +158,9 @@ pub(crate) fn lastfm_card(s: &Ui, p: Palette) -> El {
             text(message.clone())
                 .font(SMALL)
                 .color(if lastfm.error { p.danger } else { p.dim })
-                .wrap_anywhere(),
+                .px(14.0)
+                .pb(12.0)
+                .wrap(),
         );
     }
     card
@@ -120,115 +169,57 @@ pub(crate) fn lastfm_card(s: &Ui, p: Palette) -> El {
 /// The API-key field.
 fn key_field(s: &Ui, p: Palette) -> El {
     let field = s.lastfm.as_ref().expect("Last.fm is running");
-    field_frame(
-        text_input(&field.key, TextStyle::new(13.0, 400.0))
-            .key("lastfm-api-key")
-            .single_line()
-            .grow(1.0)
-            .color(p.text)
-            .placeholder("API key", p.faint)
-            .on_edit(|s: &mut Ui| &mut s.lastfm.as_mut().expect("Last.fm is running").key)
-            .on_submit(|s: &mut Ui, _: &mut Tx| s.lastfm_save_credentials()),
+    w::field_row(
         p,
+        "API key",
+        w::field_frame(
+            text_input(&field.key, TextStyle::new(13.0, 400.0))
+                .key("lastfm-api-key")
+                .single_line()
+                .grow(1.0)
+                .color(p.text)
+                .placeholder("API key", p.faint)
+                .on_edit(|s: &mut Ui| &mut s.lastfm.as_mut().expect("Last.fm is running").key)
+                .on_submit(|s: &mut Ui, _: &mut Tx| s.lastfm_save_credentials()),
+            p,
+        ),
+        None,
     )
 }
 
 /// The shared-secret field, masked.
 fn secret_field(s: &Ui, p: Palette) -> El {
     let field = s.lastfm.as_ref().expect("Last.fm is running");
-    field_frame(
-        text_input(&field.secret, TextStyle::new(13.0, 400.0))
-            .key("lastfm-secret")
-            .single_line()
-            .grow(1.0)
-            .color(p.text)
-            .placeholder("Shared secret", p.faint)
-            .secure()
-            .on_edit(|s: &mut Ui| &mut s.lastfm.as_mut().expect("Last.fm is running").secret)
-            .on_submit(|s: &mut Ui, _: &mut Tx| s.lastfm_save_credentials()),
+    w::field_row(
         p,
+        "Shared secret",
+        w::field_frame(
+            text_input(&field.secret, TextStyle::new(13.0, 400.0))
+                .key("lastfm-secret")
+                .single_line()
+                .grow(1.0)
+                .color(p.text)
+                .placeholder("Shared secret", p.faint)
+                .secure()
+                .on_edit(|s: &mut Ui| &mut s.lastfm.as_mut().expect("Last.fm is running").secret)
+                .on_submit(|s: &mut Ui, _: &mut Tx| s.lastfm_save_credentials()),
+            p,
+        ),
+        Some("tsun ships no API key: register an application at last.fm/api/account/create and paste its API key and shared secret here. They are stored in lastfm.json (0600), never in settings.json."),
     )
 }
 
-/// The border and padding both credential fields share.
-fn field_frame(input: El, p: Palette) -> El {
-    row().w_full().h(40.0).px(12.0).radius(8.0).fill(p.bg).border(1.0, p.border).center_y().child(input)
-}
-
-/// The authorization link, shown as text with a copy button beside it.
+/// The authorization link, shown as text the user can copy from.
 fn link_card(url: &str, p: Palette) -> El {
     row()
         .w_full()
         .px(12.0)
-        .py(8.0)
+        .py(10.0)
         .radius(8.0)
-        .fill(p.bg)
+        .fill(w::recess(p))
         .border(1.0, p.border)
         .center_y()
-        .child(text(url.to_owned()).font(SMALL).color(p.dim).grow(1.0).wrap_anywhere())
-}
-
-/// A live status line with a coloured dot.
-fn status_row(p: Palette, colour: Color, title: String, hint: &str) -> El {
-    row()
-        .key("lastfm-status")
-        .label(title.clone())
-        .w_full()
-        .pt(6.0)
-        .gap(8.0)
-        .center_y()
-        .child(el().size(6.0, 6.0).radius(3.0).fill(colour))
-        .child(
-            col().grow(1.0).min_w(0.0).gap(2.0)
-                .child(text(title).font(BODY).color(colour))
-                .child(text(hint.to_owned()).font(SMALL).color(p.dim).wrap_anywhere()),
-        )
-}
-
-fn card(p: Palette) -> El {
-    col().w_full().max_w(620.0).padding(16.0).gap(6.0).radius(10.0)
-        .fill(p.card).border(1.0, p.border)
-}
-
-fn section(title: &str, p: Palette) -> El {
-    text(title).font(CAPS).color(p.faint)
-}
-
-/// A boolean row with a check that flips when the row is pressed.
-fn toggle_row(
-    p: Palette,
-    key: &str,
-    title: &str,
-    detail: &str,
-    on: bool,
-    on_press: impl Fn(&mut Ui) + 'static,
-) -> El {
-    row()
-        .key(key)
-        .role("button")
-        .label(title)
-        .w_full()
-        .padding(10.0)
-        .gap(12.0)
-        .center_y()
-        .radius(6.0)
-        .fill(Color::TRANSPARENT)
-        .hover(p.card_hover)
-        .focusable(true)
-        .on_press(on_press)
-        .child(
-            col().grow(1.0).min_w(0.0).gap(2.0)
-                .child(text(title).font(TRACK).color(p.text))
-                .child(text(detail).font(SMALL).color(p.dim).wrap_anywhere()),
-        )
-        .child(check(p, on))
-}
-
-fn check(p: Palette, on: bool) -> El {
-    el().size(20.0, 20.0).center().radius(10.0)
-        .fill(if on { p.accent } else { Color::TRANSPARENT })
-        .border(1.0, if on { p.accent } else { p.border })
-        .child(icon(&ICON_CHECK, 12.0).color(if on { p.accent_ink } else { p.faint }))
+        .child(text(url.to_owned()).font(SMALL).color(p.dim).grow(1.0).min_w(0.0).truncate_middle())
 }
 
 #[cfg(test)]

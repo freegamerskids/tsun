@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -12,14 +13,13 @@ use rune::{AppHandle, Key, KeyEvent, TextEdit, Tray, TrayEvent, TrayIcon, TrayIt
 use crate::art;
 use crate::audio::Volume;
 use crate::cover::CoverArt;
-use crate::gapless::GaplessState;
 use crate::history::{History, Route};
 use crate::history_log::{self, PlayEntry};
 use crate::lastfm::LastFm;
 use crate::local;
-use crate::mpris::{Mpris, MprisCommand, MprisMeta, MprisPlayback};
+use crate::mpris::{Mpris, MprisCommand, MprisMeta, MprisPlayback, MprisTransport};
 use crate::notify::{Notification, Notifier};
-use crate::playback::{self, Queue};
+use crate::playback::{self, Queue, Upcoming, UpcomingSource};
 use crate::recent;
 use crate::settings::{Settings, StartupPage};
 use crate::tidal::{
@@ -30,7 +30,7 @@ use crate::ui::context_menu::MenuState;
 use crate::ui::dialogs::{AlbumReviewDialog, Dialog, TrackInfo};
 use crate::ui::tracks::{Derived, DerivedLibrary, DerivedTracks, Tracks};
 use crate::video;
-use crate::worker::worker;
+use crate::worker::{worker, PollTrace};
 
 /// What kind of image an element draws, so the fetch for it uses the right TIDAL variant (and
 /// is only made for art a surface actually shows).
@@ -103,17 +103,21 @@ pub(crate) enum Cmd {
     },
     SetPaused { seq: u64, paused: bool },
     Seek { seq: u64, seconds: f64 },
+    /// A transport request from the desktop (a media key or the tray) that has no track of its
+    /// own: the worker applies it to whatever is playing, without waiting for a UI frame.
+    Transport(MprisTransport),
     SetVolume(f32),
     SetMuted(bool),
     SetQuality(Quality),
     SetNormalize(bool),
     SetOutputDevice(Option<String>),
-    /// Opens the next queue track ahead of time so it can start gaplessly.
-    Preload { id: u64 },
-    /// Opens the next local queue track ahead of time for the same gapless hand-off.
-    PreloadLocal { id: u64, path: PathBuf, replaygain: Option<f32> },
-    /// Drops any outstanding preload, e.g. because the queue changed.
-    CancelPreload,
+    /// The ordered tracks a natural end moves to, so the worker can advance (and preload for
+    /// gapless playback) with no UI frame at all. `after` is the track the UI believes is
+    /// playing, which lets the worker drop what it has already played when a stalled UI catches
+    /// up and resends its list (see [`playback::UpcomingQueue`]). `cyclic` is true under
+    /// repeat-all/one, where the worker repeats the list itself rather than stopping at the end
+    /// of it.
+    SetUpcoming { after: Option<u64>, tracks: Vec<Upcoming>, cyclic: bool },
     Stop,
     Logout,
 }
@@ -173,10 +177,14 @@ pub(crate) enum Ev {
     PlaybackEnded { seq: u64, error: Option<String> },
     /// The current track reached its natural end; the queue may auto-advance.
     TrackFinished { seq: u64 },
-    /// The preloaded next track was swapped in without interrupting the output: the queue has
-    /// advanced, but the same stream is still playing. `output` is the format it is running at
-    /// (it can change when the hand-off had to re-open the device).
-    GaplessAdvanced { seq: u64, id: u64, output: Option<String> },
+    /// The worker advanced the queue by itself — the next track started (gaplessly, when its
+    /// audio was preloaded) without any UI frame. `output` is the format the stream is running
+    /// at (it can change when the hand-off had to re-open the device), `quality` what TIDAL
+    /// served ( `None` for a gapless hand-off, whose stream was resolved at preload time).
+    AutoAdvanced { seq: u64, track: Track, quality: Option<String>, output: Option<String> },
+    /// A desktop transport request (a media key or the tray) that the worker could not apply
+    /// itself because no track was playing: the UI starts playback when it next runs.
+    TransportRequest(MprisTransport),
     Stopped,
 }
 
@@ -504,8 +512,9 @@ pub(crate) struct Ui {
     pub(crate) lyrics_open: bool,
     /// Whether the full-screen Now Playing overlay is up.
     pub(crate) now_playing_open: bool,
-    /// The preload state machine behind gapless playback.
-    pub(crate) preload: GaplessState,
+    /// The shared beacon `poll` marks every frame so the worker can say when the window stopped
+    /// being drawn at all ( `None` unless `TSUN_TRACE_POLL` is set).
+    pub(crate) poll_trace: Option<Arc<PollTrace>>,
     /// Average cover colours for the overlay's gradient, computed off the frame.
     pub(crate) covers: Option<CoverArt>,
     /// Desktop notifications, when the user has them on and a session bus is reachable.
@@ -513,6 +522,13 @@ pub(crate) struct Ui {
     /// The host's output devices as `(name, is_default)`, enumerated when the Settings page is
     /// first shown (or when its Refresh button is pressed) rather than once per frame.
     pub(crate) output_devices: Option<Vec<(String, bool)>>,
+    /// Which Settings category the page shows.
+    pub(crate) settings_section: std::cell::Cell<crate::ui::settings::SettingsSection>,
+    /// Whether the window is wide enough for Settings' side navigation; set from the laid-out
+    /// `main` width, so the page re-runs only as it crosses the breakpoint.
+    pub(crate) settings_nav_wide: std::cell::Cell<bool>,
+    /// Whether the Settings output-device dropdown is open.
+    pub(crate) settings_output_open: bool,
     pub(crate) search_seq: u64,
     pub(crate) play_seq: u64,
     /// The play queue: play order, current track, shuffle and repeat.
@@ -771,10 +787,13 @@ pub(crate) fn init() -> Ui {
         lyrics_scroll_retry: 0,
         lyrics_open: false,
         now_playing_open: false,
-        preload: GaplessState::new(),
+        poll_trace: None,
         covers: None,
         notifier: None,
         output_devices: None,
+        settings_section: std::cell::Cell::new(crate::ui::settings::SettingsSection::General),
+        settings_nav_wide: std::cell::Cell::new(false),
+        settings_output_open: false,
         search_seq: 0,
         play_seq: 0,
         queue,
@@ -872,7 +891,24 @@ pub(crate) fn setup(s: &mut Ui, waker: Waker) {
             wake.as_ref()();
         }
     });
+    // Play/pause goes straight to the worker, so a media key (or the tray) still works when the
+    // window is hidden or covered and no frames are being drawn at all. Next/previous, seek,
+    // volume and stop still need the UI, because they need the queue.
+    let (transport_tx, transport_rx) = mpsc::channel();
+    let wake = waker.clone();
+    let worker_commands = s.cmd_tx.clone();
+    thread::spawn(move || {
+        while let Ok(command) = transport_rx.recv() {
+            if worker_commands.send(Cmd::Transport(command)).is_err() {
+                break;
+            }
+            wake.as_ref()();
+        }
+    });
     s.mpris = Mpris::start(mpris_tx.clone()).ok();
+    if let Some(mpris) = &s.mpris {
+        mpris.set_transport_sink(transport_tx.clone());
+    }
     s.mpris_rx = Some(forward_rx);
     s.covers = Some(CoverArt::new(waker.clone()));
     // Last.fm scrobbling on its own thread, so its network work never touches a frame.
@@ -881,13 +917,18 @@ pub(crate) fn setup(s: &mut Ui, waker: Waker) {
     s.waker = Some(waker.clone());
     s.load_local_library();
     // A status-notifier tray, when the session has one. Its transport items ride the same
-    // channel as the desktop media keys, so there is one code path for both.
-    install_tray(s, waker.clone(), mpris_tx);
+    // channels as the desktop media keys, so there is one code path for both.
+    install_tray(s, waker.clone(), mpris_tx, transport_tx);
     // Desktop notifications are opt-in; a missing session bus just leaves them off.
     if s.settings.notifications {
         s.notifier = Notifier::start().ok();
     }
-    thread::spawn(move || worker(cmd_rx, ev_tx, waker));
+    // Off by default: when set, the worker reports on stderr whenever frames stop being drawn
+    // while a track is playing (a compositor withholding frame callbacks), which is the one
+    // failure that used to stall every queue decision with them.
+    s.poll_trace = PollTrace::from_env();
+    let trace = s.poll_trace.clone();
+    thread::spawn(move || worker(cmd_rx, ev_tx, waker, trace));
     // `tsun song.flac` starts that file as a one-off queue, beside the configured library.
     let files = local::cli_audio_files();
     if !files.is_empty() {
@@ -956,7 +997,12 @@ fn tray_icon() -> TrayIcon {
 /// Transport picks are sent back as the same commands the desktop media keys use; show and quit
 /// go straight to the event loop through the app handle, so the tray works while the window is
 /// hidden. A session that cannot host a tray simply runs without one.
-fn install_tray(s: &mut Ui, waker: Waker, commands: Sender<MprisCommand>) {
+fn install_tray(
+    s: &mut Ui,
+    waker: Waker,
+    commands: Sender<MprisCommand>,
+    transport: Sender<MprisTransport>,
+) {
     if rune::is_headless() {
         return;
     }
@@ -970,8 +1016,10 @@ fn install_tray(s: &mut Ui, waker: Waker, commands: Sender<MprisCommand>) {
             None => handle.open(),
         },
         TrayEvent::Menu(id) => match id.as_str() {
+            // Play/pause takes the direct path to the worker: the tray is reachable exactly
+            // when the window is hidden, which is when no frames are drawn.
             "play-pause" => {
-                let _ = commands.send(MprisCommand::PlayPause);
+                let _ = transport.send(MprisTransport::PlayPause);
                 waker.as_ref()();
             }
             "previous" => {
@@ -1011,6 +1059,11 @@ pub(crate) fn on_close(s: &mut Ui, tx: &mut Tx) {
 }
 
 pub(crate) fn poll(s: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
+    // Tell the worker the UI thread is still running frames, so it can report a stall (see
+    // `PollTrace`) instead of leaving the user guessing why nothing advances.
+    if let Some(trace) = &s.poll_trace {
+        trace.mark();
+    }
     let mut changed = drain_events(s);
     changed |= drain_mpris(s, tx);
     // Last.fm's scrobble thread reports connection and scrobble status back here.
@@ -1261,7 +1314,10 @@ fn drain_mpris(s: &mut Ui, tx: &mut Tx) -> bool {
 }
 
 impl Ui {
-    fn apply(&mut self, ev: Ev) {
+    /// Applies one worker event to the state machine. `pub(crate)` so the worker's
+    /// integration test can feed a frozen UI's backlog of events through the same path
+    /// `poll` uses.
+    pub(crate) fn apply(&mut self, ev: Ev) {
         match ev {
             Ev::Ready { logged_in } => {
                 self.notice = None;
@@ -1816,15 +1872,10 @@ impl Ui {
             }
             Ev::PlaybackProgress { seq, elapsed } => {
                 if seq == self.play_seq {
-                    let mut remaining = None;
                     if let Some(playing) = &mut self.now_playing {
                         playing.elapsed = elapsed;
-                        remaining = playing
-                            .duration
-                            .map(|duration| duration.saturating_sub(elapsed));
                     }
                     self.record_play_if_listened(elapsed, false);
-                    self.tick_preload(remaining);
                 }
             }
             Ev::TrackFinished { seq } => {
@@ -1835,11 +1886,21 @@ impl Ui {
                     self.advance_queue();
                 }
             }
-            Ev::GaplessAdvanced { seq, id, output } => {
+            Ev::AutoAdvanced { seq, track, quality, output } => {
                 if seq == self.play_seq && !self.stopping {
-                    self.preload.switched(id);
-                    self.advance_to_id(id, output);
+                    // The worker played the track the queue would have played next, on its own:
+                    // close out the track that ended exactly as a UI-driven advance would, then
+                    // follow to the new one without re-issuing anything to the worker.
+                    let elapsed = self.current_elapsed();
+                    self.record_play_if_listened(elapsed, true);
+                    self.media_finished();
+                    self.adopt_advanced(track, quality, output);
                 }
+            }
+            Ev::TransportRequest(command) => {
+                // A media key (or the tray) asked for play/pause while nothing was playing, so
+                // the worker could not act on it itself. Starting playback needs the queue.
+                self.transport_request(command);
             }
             Ev::PlayFailed { seq, error } => {
                 if seq == self.play_seq {
@@ -1859,7 +1920,6 @@ impl Ui {
                     self.paused = false;
                     self.pause_pending = false;
                     self.stopping = false;
-                    self.preload = GaplessState::new();
                     self.now_playing_open = false;
                     self.clear_lyrics();
                     if let Some(error) = error {
@@ -1874,7 +1934,6 @@ impl Ui {
                 self.paused = false;
                 self.pause_pending = false;
                 self.stopping = false;
-                self.preload = GaplessState::new();
                 self.now_playing_open = false;
                 self.clear_lyrics();
             }
@@ -2284,6 +2343,7 @@ impl Ui {
     /// data, keeping whatever the caller already had for its header.
     fn show(&mut self, route: Route) {
         self.page = route.page();
+        self.settings_output_open = false;
         self.remember_route(&route);
         match route {
             Route::Home => {
@@ -2734,8 +2794,6 @@ impl Ui {
             self.pending_play = None;
             return;
         }
-        // A fresh track supersedes anything preloaded for the old one.
-        self.cancel_preload();
         self.selected = Some(id);
         self.play_seq += 1;
         self.paused = false;
@@ -2764,15 +2822,20 @@ impl Ui {
             self.pending_play = None;
             self.notice = Some(Notice::error("The TIDAL worker is not running."));
         }
+        // Hand the worker the order that follows this track, so it can play on by itself if the
+        // window stops being drawn.
+        self.send_upcoming();
     }
 
-    /// Adopts `id` as the current track after a gapless hand-off: the audio thread has already
-    /// started it, so the queue and the metadata move but nothing is re-issued to the worker.
-    fn advance_to_id(&mut self, id: u64, output: Option<String>) {
-        let Some(index) = self.queue.tracks().iter().position(|track| track.id == id) else {
-            return;
-        };
-        let Some(track) = self.queue.jump(index) else { return };
+    /// Adopts a track the worker started on its own as the current one. Nothing is re-issued to
+    /// the worker: it is already playing `track`, and the UI is only catching up.
+    fn adopt_advanced(&mut self, track: Track, quality: Option<String>, output: Option<String>) {
+        let id = track.id;
+        // Move the queue onto it when the queue still holds it; a track it does not hold (the
+        // UI's view of the queue moved on without the worker) is still what is playing.
+        if let Some(index) = self.queue.tracks().iter().position(|existing| existing.id == id) {
+            self.queue.jump(index);
+        }
         // The output format is whatever the hand-off is really running at; fall back to the
         // previous label when the worker could not read it.
         let output = output.or_else(|| self.now_playing.as_ref().and_then(|playing| playing.output.clone()));
@@ -2791,7 +2854,7 @@ impl Ui {
             cover: track.cover,
             album_id: track.album_id,
             artist_id: track.artist_id,
-            quality: None,
+            quality,
             elapsed: 0,
             duration: track.duration,
             output,
@@ -2799,46 +2862,38 @@ impl Ui {
         self.load_lyrics(id);
         self.notify_now_playing();
         self.media_started(0.0);
+        // The worker has walked one entry off its window; hand it the fresh tail so it keeps
+        // having somewhere to go.
+        self.send_upcoming();
     }
 
-    /// Asks the worker to open the next queue track ahead of time once this one is nearly over,
-    /// so the audio thread can hand over without a gap. Cheap to call on every progress tick.
-    fn tick_preload(&mut self, remaining: Option<u64>) {
-        if self.now_playing.is_none() {
-            return;
-        }
-        let next = self.queue.peek_advance().map(|track| track.id);
-        if let Some(id) = self.preload.next_preload(remaining, next) {
-            let current_local = self
-                .now_playing
-                .as_ref()
-                .is_some_and(|playing| local::is_local_id(playing.id));
-            // The gapless hand-off happens inside one player, so it only works when both tracks
-            // come from the same side: TIDAL resolves TIDAL ids, and the local file path comes
-            // from the library index. Across the boundary the next track simply starts the
-            // ordinary way.
-            match (self.local_track(id), current_local) {
-                (Some(track), true) => {
-                    let _ = self.cmd_tx.send(Cmd::PreloadLocal {
-                        id,
-                        path: track.path.clone(),
-                        replaygain: track.replaygain,
-                    });
-                }
-                (None, false) => {
-                    let _ = self.cmd_tx.send(Cmd::Preload { id });
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Invalidates any outstanding preload because the queue changed. Only costs when one is
-    /// actually armed.
-    fn cancel_preload(&mut self) {
-        if self.preload.invalidate() {
-            let _ = self.cmd_tx.send(Cmd::CancelPreload);
-        }
+    /// Hands the worker the upcoming order: the tracks a natural end moves to, in the order it
+    /// would play them, so auto-advance (and the gapless preload behind it) never needs a UI
+    /// frame. Sent whenever the order can change — a track starts, the queue is edited, shuffle
+    /// or repeat is toggled — and cheap enough to call on every one of those.
+    fn send_upcoming(&self) {
+        let tracks: HashMap<u64, &Track> =
+            self.queue.tracks().iter().map(|track| (track.id, track)).collect();
+        let entries: Vec<Upcoming> = playback::upcoming_ids(&self.queue, playback::UPCOMING_LIMIT)
+            .into_iter()
+            .filter_map(|id| {
+                let track = (*tracks.get(&id)?).clone();
+                let source = match self.local_track(id) {
+                    Some(local) => UpcomingSource::Local {
+                        path: local.path.clone(),
+                        quality: local.quality_label(),
+                        replaygain: local.replaygain,
+                    },
+                    None => UpcomingSource::Tidal,
+                };
+                Some(Upcoming { track, source })
+            })
+            .collect();
+        let _ = self.cmd_tx.send(Cmd::SetUpcoming {
+            after: self.queue.current_id(),
+            tracks: entries,
+            cyclic: self.queue.repeat() != playback::Repeat::Off,
+        });
     }
 
     /// Posts a desktop notification for the track that just started, when the user has them on.
@@ -2929,7 +2984,7 @@ impl Ui {
     /// Removes the queue row at `index` (the row's x button).
     pub(crate) fn remove_from_queue(&mut self, index: usize) {
         self.queue.remove(index);
-        self.cancel_preload();
+        self.send_upcoming();
     }
 
     /// Clears the queue, keeping whatever is currently playing.
@@ -2938,7 +2993,7 @@ impl Ui {
             Some(track) => self.queue.set(vec![track], 0),
             None => self.queue.clear(),
         }
-        self.cancel_preload();
+        self.send_upcoming();
     }
 
     /// Plays `track` immediately after the current one ("Play next"). Context menus call this;
@@ -2950,8 +3005,7 @@ impl Ui {
             self.start_track(track);
         } else {
             self.queue.insert_next(track);
-            // The preloaded track is no longer what comes next.
-            self.cancel_preload();
+            self.send_upcoming();
         }
     }
 
@@ -2964,6 +3018,7 @@ impl Ui {
             self.start_track(track);
         } else {
             self.queue.push_back(track);
+            self.send_upcoming();
         }
     }
 
@@ -3117,8 +3172,8 @@ impl Ui {
         self.queue.set_shuffle(on);
         self.settings.shuffle = on;
         self.settings.save();
-        // Shuffling changes what comes next, so any preload is now the wrong track.
-        self.cancel_preload();
+        // Shuffling changes what comes next.
+        self.send_upcoming();
     }
 
     /// Cycles repeat off → all → one and persists it.
@@ -3127,7 +3182,7 @@ impl Ui {
         self.queue.set_repeat(repeat);
         self.settings.repeat = repeat;
         self.settings.save();
-        self.cancel_preload();
+        self.send_upcoming();
     }
 
     /// Sets the streaming-quality preference and persists it.
@@ -3274,19 +3329,9 @@ impl Ui {
             // The video view owns the transport while it is up, exactly as it
             // owns the output device.
             match command {
-                MprisCommand::Play => {
-                    if let Some(session) = &self.video {
-                        session.engine.set_paused(false);
-                        self.publish_mpris();
-                    }
-                }
-                MprisCommand::Pause => {
-                    if let Some(session) = &self.video {
-                        session.engine.set_paused(true);
-                        self.publish_mpris();
-                    }
-                }
-                MprisCommand::PlayPause => self.toggle_video_pause(),
+                MprisCommand::Play => self.apply_transport(Some(true)),
+                MprisCommand::Pause => self.apply_transport(Some(false)),
+                MprisCommand::PlayPause => self.apply_transport(None),
                 MprisCommand::Stop => self.close_video(),
                 MprisCommand::SeekTo(micros) => {
                     if let Some(session) = &self.video {
@@ -3309,19 +3354,9 @@ impl Ui {
             return;
         }
         match command {
-            MprisCommand::Play => self.resume_or_play(),
-            MprisCommand::Pause => {
-                if self.now_playing.is_some() && !self.paused {
-                    self.toggle_pause();
-                }
-            }
-            MprisCommand::PlayPause => {
-                if self.now_playing.is_some() {
-                    self.toggle_pause();
-                } else {
-                    self.play_from_queue();
-                }
-            }
+            MprisCommand::Play => self.apply_transport(Some(true)),
+            MprisCommand::Pause => self.apply_transport(Some(false)),
+            MprisCommand::PlayPause => self.apply_transport(None),
             MprisCommand::Stop => self.stop(),
             MprisCommand::Next => self.skip_next(),
             MprisCommand::Previous => self.skip_previous(),
@@ -3332,6 +3367,58 @@ impl Ui {
                 self.set_volume(volume as f32);
             }
             MprisCommand::Quit => tx.quit(),
+        }
+    }
+
+    /// Applies a desktop play/pause: `Some(true)` plays, `Some(false)` pauses, `None` toggles.
+    ///
+    /// The video view owns the transport while it is up. Otherwise this is both what a media
+    /// key or the tray asks for — the worker applies it directly when a track is playing, and
+    /// passes it back as [`Ev::TransportRequest`] when nothing is — and what the command channel
+    /// carries when the desktop has no fast path.
+    fn apply_transport(&mut self, play: Option<bool>) {
+        if self.video_active() {
+            match play {
+                Some(true) => {
+                    if let Some(session) = &self.video {
+                        session.engine.set_paused(false);
+                        self.publish_mpris();
+                    }
+                }
+                Some(false) => {
+                    if let Some(session) = &self.video {
+                        session.engine.set_paused(true);
+                        self.publish_mpris();
+                    }
+                }
+                None => self.toggle_video_pause(),
+            }
+            return;
+        }
+        match play {
+            Some(true) => self.resume_or_play(),
+            Some(false) => {
+                if self.now_playing.is_some() && !self.paused {
+                    self.toggle_pause();
+                }
+            }
+            None => {
+                if self.now_playing.is_some() {
+                    self.toggle_pause();
+                } else {
+                    self.play_from_queue();
+                }
+            }
+        }
+    }
+
+    /// Applies a play/pause request the worker passed back because no track was playing, so it
+    /// had nothing to act on. Starting playback needs the queue, which only the UI owns.
+    fn transport_request(&mut self, command: MprisTransport) {
+        match command {
+            MprisTransport::Play => self.apply_transport(Some(true)),
+            MprisTransport::Pause => self.apply_transport(Some(false)),
+            MprisTransport::PlayPause => self.apply_transport(None),
         }
     }
 
@@ -3461,7 +3548,8 @@ impl Ui {
             return;
         }
         if self.now_playing.is_some() || self.pending_play.is_some() || !self.queue.is_empty() {
-            // The music player and a video must never share the output.
+            // The music player and a video must never share the output. The worker drops its
+            // upcoming order with the stop, so no music auto-advances behind the video.
             let _ = self.cmd_tx.send(Cmd::Stop);
         }
         self.now_playing = None;
@@ -3469,7 +3557,6 @@ impl Ui {
         self.paused = false;
         self.pause_pending = false;
         self.stopping = false;
-        self.preload = GaplessState::new();
         self.now_playing_open = false;
         self.scrub = None;
         self.clear_lyrics();
@@ -3695,8 +3782,8 @@ impl Ui {
     pub(crate) fn move_queue_item(&mut self, from: usize, to: usize) {
         self.menu = None;
         if self.queue.move_item(from, to) {
-            // The track that comes next may have changed, so any preload is now the wrong one.
-            self.cancel_preload();
+            // The track that comes next may have changed.
+            self.send_upcoming();
         }
     }
 
@@ -3955,6 +4042,10 @@ pub(crate) fn on_key(s: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
             s.collection_sort_open = false;
             return true;
         }
+        if s.settings_output_open {
+            s.settings_output_open = false;
+            return true;
+        }
         if s.queue_open {
             s.queue_open = false;
             return true;
@@ -4114,6 +4205,47 @@ mod tests {
         if let Some(rx) = &s.cmd_rx {
             assert!(rx.try_recv().is_err(), "no command was issued");
         }
+    }
+
+    /// An auto-advance the worker did on its own moves the queue, and one that belongs to a play
+    /// the user has already replaced is ignored: that is what keeps a click racing an
+    /// auto-advance from double-advancing or skipping a track. Nothing here re-issues a play for
+    /// the advanced track, because the worker is already playing it.
+    #[test]
+    fn an_auto_advance_follows_the_queue_and_a_stale_one_is_ignored() {
+        let track = |id: u64| Track { id, title: format!("T{id}"), ..Track::default() };
+        let mut s = init();
+        drain(&s);
+        s.queue.set(vec![track(1), track(2), track(3)], 0);
+        s.start_track(track(1));
+        s.apply(Ev::Playing { seq: 1, id: 1, quality: "FLAC".to_owned(), output: None });
+        assert_eq!(s.now_playing.as_ref().map(|playing| playing.id), Some(1));
+        assert_eq!(s.play_seq, 1);
+
+        // A late advance from an older play changes nothing.
+        s.apply(Ev::AutoAdvanced { seq: 0, track: track(9), quality: None, output: None });
+        assert_eq!(s.queue.current_id(), Some(1));
+        assert_eq!(s.now_playing.as_ref().map(|playing| playing.id), Some(1));
+
+        // The current play's advance moves the queue and the now-playing track, without a
+        // second play being issued for it.
+        drain(&s);
+        s.apply(Ev::AutoAdvanced { seq: 1, track: track(2), quality: None, output: None });
+        assert_eq!(s.now_playing.as_ref().map(|playing| playing.id), Some(2));
+        assert_eq!(s.queue.current_id(), Some(2));
+        assert_eq!(s.queue.index(), Some(1));
+
+        // A click while an advance is in flight: the click wins its own sequence, so the late
+        // advance and the late finish are both stale and must not skip a track.
+        s.play_queue_index(2);
+        assert_eq!(s.play_seq, 2);
+        assert_eq!(s.queue.current_id(), Some(3));
+        s.apply(Ev::AutoAdvanced { seq: 1, track: track(2), quality: None, output: None });
+        s.apply(Ev::TrackFinished { seq: 1 });
+        assert_eq!(s.queue.current_id(), Some(3), "the stale events left the queue alone");
+        assert!(s.now_playing.is_none(), "the clicked track is still starting");
+        s.apply(Ev::Playing { seq: 2, id: 3, quality: "FLAC".to_owned(), output: None });
+        assert_eq!(s.now_playing.as_ref().map(|playing| playing.id), Some(3));
     }
 
     /// The sidebar plus the queue and lyrics panels leave a narrow window's main area no width,

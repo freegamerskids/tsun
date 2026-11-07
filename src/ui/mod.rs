@@ -30,6 +30,7 @@ pub(crate) mod settings;
 pub(crate) mod settings_discord;
 pub(crate) mod settings_lastfm;
 pub(crate) mod settings_local;
+pub(crate) mod settings_widgets;
 pub(crate) mod sidebar;
 pub(crate) mod topbar;
 pub(crate) mod tracks;
@@ -54,6 +55,12 @@ pub(crate) fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
     // Below this window width the sidebar, both side panels and a usable main area do not fit.
     if let Some(narrow) = cx.layout_with("app", |rect| rect[2] < 1280.0) {
         s.narrow_window.set(narrow);
+    }
+    // Settings keeps its side navigation while the page's own column (navigation, a 720-point
+    // content column and the page padding) fits beside it; below that it folds to a strip over
+    // the content. A breakpoint read, like the widths above.
+    if let Some(wide) = cx.layout_with("main", |rect| rect[2] >= 1000.0) {
+        s.settings_nav_wide.set(wide);
     }
     let p = palette();
     let mut body = row()
@@ -113,13 +120,34 @@ pub(crate) fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
                 .on_press(|s: &mut Ui| s.collection_sort_open = false))
             .child(collection::sort_menu(s, p).anchored("collection-sort", Side::Bottom, Align::Start, 8.0));
     }
+    // The Settings output-device dropdown, anchored under its trigger like the sort menu.
+    if s.settings_output_open && s.page == Page::Settings {
+        root = root
+            .child(el().key("settings-output-dismiss").absolute(0.0, 0.0).w_full().h_full()
+                .on_press(|s: &mut Ui| s.settings_output_open = false))
+            .child(
+                settings::output_menu(s, p)
+                    .anchored_fit("settings-output-select", Side::Bottom, Align::End, 6.0),
+            );
+    }
     // The context menu: a scrim that dismisses, the popup anchored to the row or header the
-    // press came from, and its "Add to playlist" submenu beside the popup's own item.
+    // press came from (or to the cursor, for a right-click), and its "Add to playlist" submenu
+    // beside the popup's own item.
     if let Some(menu) = &s.menu {
         root = root
             .child(el().key("context-menu-dismiss").absolute(0.0, 0.0).w_full().h_full()
-                .on_press(|s: &mut Ui| s.close_menu()))
-            .child(context_menu::menu(s, p).anchored_fit(menu.anchor.clone(), Side::Bottom, Align::End, 4.0));
+                .on_press(|s: &mut Ui| s.close_menu()));
+        let anchor = match menu.at {
+            Some((x, y)) => {
+                // An empty marker at the pointer, which the popup hangs from (and is kept
+                // inside the window by `anchored_fit`).
+                root = root.child(el().key("context-menu-cursor").absolute(x, y).size(1.0, 1.0));
+                "context-menu-cursor".to_owned()
+            }
+            None => menu.anchor.clone(),
+        };
+        let align = if menu.at.is_some() { Align::Start } else { Align::End };
+        root = root.child(context_menu::menu(s, p).anchored_fit(anchor, Side::Bottom, align, 4.0));
         if menu.submenu {
             root = root.child(
                 context_menu::playlist_picker(s, p)

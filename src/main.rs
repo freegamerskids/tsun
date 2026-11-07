@@ -13,7 +13,6 @@ mod art;
 mod audio;
 mod cover;
 mod discord;
-mod gapless;
 mod history;
 mod history_log;
 mod lastfm;

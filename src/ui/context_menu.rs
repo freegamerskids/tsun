@@ -30,6 +30,9 @@ pub(crate) struct MenuState {
     pub(crate) anchor: String,
     /// Whether the "Add to playlist" submenu is showing beside the menu.
     pub(crate) submenu: bool,
+    /// Where the pointer was for a right-click: the popup opens there rather than under its
+    /// anchor element, which then only names the row the menu belongs to.
+    pub(crate) at: Option<(f32, f32)>,
 }
 
 /// What an open context menu acts on.
@@ -80,27 +83,34 @@ impl TrackMenu {
 impl MenuState {
     /// A menu for a track row, anchored to `anchor`.
     pub(crate) fn track(anchor: impl Into<String>, menu: TrackMenu) -> Self {
-        MenuState { target: MenuTarget::Track(menu), anchor: anchor.into(), submenu: false }
+        MenuState { target: MenuTarget::Track(menu), anchor: anchor.into(), submenu: false, at: None }
     }
 
     /// A menu for an album, anchored to `anchor`.
     pub(crate) fn album(anchor: impl Into<String>, album: Album) -> Self {
-        MenuState { target: MenuTarget::Album(album), anchor: anchor.into(), submenu: false }
+        MenuState { target: MenuTarget::Album(album), anchor: anchor.into(), submenu: false, at: None }
     }
 
     /// A menu for an artist, anchored to `anchor`.
     pub(crate) fn artist(anchor: impl Into<String>, artist: Artist) -> Self {
-        MenuState { target: MenuTarget::Artist(artist), anchor: anchor.into(), submenu: false }
+        MenuState { target: MenuTarget::Artist(artist), anchor: anchor.into(), submenu: false, at: None }
     }
 
     /// A menu for a playlist, anchored to `anchor`.
     pub(crate) fn playlist(anchor: impl Into<String>, playlist: Playlist) -> Self {
-        MenuState { target: MenuTarget::Playlist(playlist), anchor: anchor.into(), submenu: false }
+        MenuState { target: MenuTarget::Playlist(playlist), anchor: anchor.into(), submenu: false, at: None }
     }
 
     /// A menu for a custom mix, anchored to `anchor`.
     pub(crate) fn mix(anchor: impl Into<String>, mix: Mix) -> Self {
-        MenuState { target: MenuTarget::Mix(mix), anchor: anchor.into(), submenu: false }
+        MenuState { target: MenuTarget::Mix(mix), anchor: anchor.into(), submenu: false, at: None }
+    }
+
+    /// Opens the menu at the pointer (a right-click) instead of under the element it is
+    /// anchored to. `press` is in window points, as `on_secondary_press` gives it.
+    pub(crate) fn at(mut self, press: rune::PointerPress) -> Self {
+        self.at = Some((press.x, press.y));
+        self
     }
 }
 
@@ -144,7 +154,7 @@ pub(crate) fn header_menu_button(p: Palette, key: &str, label: &str, menu: MenuS
         .focusable(true)
         .on_press(move |s: &mut Ui| {
             let anchor = template.anchor.clone();
-            s.open_menu(MenuState { target: template.target.clone(), anchor, submenu: false });
+            s.open_menu(MenuState { target: template.target.clone(), anchor, submenu: false, at: None });
         })
         .child(icon(&ICON_MORE, 18.0).color(p.text))
 }
@@ -626,9 +636,43 @@ fn track_url(id: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{Login, init};
+    use crate::tidal::Track;
 
     #[test]
     fn track_links_point_at_tidals_web_player() {
         assert_eq!(track_url(62300893), "https://tidal.com/browse/track/62300893");
+    }
+
+    /// A right-click menu opens at the pointer; a "…" button's menu stays under the button.
+    #[test]
+    fn a_right_click_menu_opens_at_the_pointer() {
+        let _env = crate::settings::lock_config_env();
+        let track = Track { id: 7, title: "Song".to_owned(), ..Track::default() };
+        let menu = TrackMenu { track, list: None, index: 0, playlist: None, queue: false };
+        let popup_origin = |at: Option<(f32, f32)>| {
+            let mut s = init();
+            s.login = Login::LoggedIn;
+            let mut state = MenuState::track("search", menu.clone());
+            if let Some((x, y)) = at {
+                state = state.at(rune::PointerPress { x, y });
+            }
+            s.menu = Some(state);
+            let mut rt = rune::Runtime::new(s, crate::ui::view, (1280.0, 800.0), rune::Env::new(true, 1.0));
+            rt.frame(0.0);
+            rt.frame(0.0);
+            let rect = rt
+                .elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("context-menu"))
+                .expect("the popup is up")
+                .rect;
+            (rect[0], rect[1])
+        };
+        let (x, y) = popup_origin(Some((520.0, 300.0)));
+        assert!((x - 520.0).abs() < 8.0 && (y - 304.0).abs() < 8.0, "popup at ({x}, {y}), pointer at (520, 300)");
+        // Without a point it hangs under the anchor element instead (here the search box, near the top).
+        let (_, anchored_y) = popup_origin(None);
+        assert!(anchored_y < 200.0, "an anchored popup stays under its element: y = {anchored_y}");
     }
 }

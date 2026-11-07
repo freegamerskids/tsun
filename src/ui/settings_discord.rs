@@ -6,87 +6,119 @@
 //! switches say is real: the switches are handed to the running [`Discord`](crate::discord)
 //! client and change what it publishes, and the status line is the client thread's own state.
 
-use rune::{Color, El, TextStyle, col, el, icon, row, text, text_input};
+use rune::{El, TextStyle, col, icon, row, text, text_input};
 
 use crate::app::Ui;
 use crate::discord::{self, Config, Status, client_id_is_usable};
-use crate::theme::{BODY, CAPS, ICON_CHECK, SMALL, TRACK, Palette};
+use crate::theme::{ICON_CHECK, SMALL, Palette};
+use crate::ui::settings_widgets::{self as w, Tone};
 
 /// The Discord Rich Presence card.
 pub(crate) fn discord_card(s: &Ui, p: Palette) -> El {
     let enabled = s.settings.discord_enabled;
-    let typed = s.discord_client_id.text.trim();
-    let mut card = card(p)
-        .child(section("Discord Rich Presence", p))
+    let status = enabled.then(|| s.discord_status.clone().unwrap_or(Status::NotRunning));
+    let badge = status
+        .as_ref()
+        .map(|status| w::status_badge(p, status_tone(status), &status.label()));
+    let mut card = w::card(p)
+        .key("discord-card")
         .child(
-            text(
-                "Shows what you are listening to on your Discord profile. It works as it is: \
-                 tsun publishes the presence under its own Discord application, so there is \
-                 nothing to sign up for.",
-            )
-            .font(SMALL)
-            .color(p.faint)
-            .wrap_anywhere(),
+            row().w_full().padding(14.0).child(w::card_header(
+                p,
+                "Discord Rich Presence",
+                "Tell your Discord profile what you are listening to.",
+                badge,
+            )),
         )
-        .child(field_row(s, p, enabled))
-        .child(activity_name_row(s, p))
-        .child(toggle_row(
+        .child(w::toggle_row(
             p,
             "discord-enabled",
             "Show what I'm listening to",
-            "Publishes the current track as your Discord activity, through the built-in \
-             application (or the one you name below).",
+            Some("Publishes the current track as your Discord activity, through the built-in application (or the one you name below)."),
             enabled,
             |s: &mut Ui| s.set_discord_enabled(!s.settings.discord_enabled),
         ));
-    if enabled {
-        card = card.child(status_row(s, p));
-    }
-    if !client_id_is_usable(typed) {
+    if let Some(status) = &status {
         card = card.child(
-            text("An Application ID is 17 to 20 digits, or empty for the built-in application.")
-                .font(SMALL)
-                .color(p.danger)
-                .wrap_anywhere(),
+            row()
+                .key("discord-status")
+                .w_full()
+                .px(14.0)
+                .pb(12.0)
+                .child(w::note(
+                    w::tone_color(status_tone(status), p),
+                    status_hint(status),
+                )),
         );
     }
+    card = card.child(w::divider(p)).child(
+        col()
+            .w_full()
+            .padding(14.0)
+            .gap(16.0)
+            .child(field_row(s, p, enabled))
+            .child(activity_name_row(s, p)),
+    );
     card = card
-        .child(toggle_row(
+        .child(w::divider(p))
+        .child(w::toggle_row(
             p,
             "discord-show-art",
             "Show album art",
-            "Sends the TIDAL cover as the activity's large image (Discord fetches it itself).",
+            Some("Sends the TIDAL cover as the activity's large image (Discord fetches it itself)."),
             s.settings.discord_show_art,
             |s: &mut Ui| s.set_discord_show_art(!s.settings.discord_show_art),
         ))
-        .child(toggle_row(
+        .child(w::divider(p))
+        .child(w::toggle_row(
             p,
             "discord-show-time",
             "Show elapsed and remaining time",
-            "Sends start and end times so Discord draws the progress bar; it follows seeking.",
+            Some("Sends start and end times so Discord draws the progress bar; it follows seeking."),
             s.settings.discord_show_time,
             |s: &mut Ui| s.set_discord_show_time(!s.settings.discord_show_time),
         ))
-        .child(toggle_row(
+        .child(w::divider(p))
+        .child(w::toggle_row(
             p,
             "discord-button",
             "Show a Listen on TIDAL button",
-            "Adds a button linking to the track's TIDAL page. Local files have no such page, so \
-             they never get one. Other people see the button; Discord hides it from you.",
+            Some("Adds a button linking to the track's TIDAL page. Other people see the button; Discord hides it from you, and local files have no TIDAL page."),
             s.settings.discord_show_button,
             |s: &mut Ui| s.set_discord_show_button(!s.settings.discord_show_button),
         ))
         .child(
-            text(
-                "Paused playback is sent without timestamps and with \"Paused\" in the state, \
-                 because Discord has no paused flag. Your Discord friends see whatever tsun is \
-                 playing (and, for TIDAL tracks, the track's link) whenever this is on.",
-            )
-            .font(SMALL)
-            .color(p.faint)
-            .wrap_anywhere(),
+            text("Paused playback is sent without timestamps and with \"Paused\" in the state, because Discord has no paused flag.")
+                .font(SMALL)
+                .color(p.faint)
+                .px(14.0)
+                .py(10.0)
+                .wrap(),
         );
     card
+}
+
+/// The tone the status badge and its note draw in.
+fn status_tone(status: &Status) -> Tone {
+    if status.is_connected() {
+        Tone::Ok
+    } else if matches!(status, Status::Connecting) {
+        Tone::Warn
+    } else if matches!(status, Status::Error(_)) {
+        Tone::Error
+    } else {
+        Tone::Off
+    }
+}
+
+/// What to do about the current status.
+fn status_hint(status: &Status) -> &'static str {
+    match status {
+        Status::Connected(_) => "Your Discord friends see the current track.",
+        Status::Connecting => "Looking for the Discord client on this machine.",
+        Status::NotRunning => "Start the Discord desktop app and tsun will connect.",
+        Status::Error(_) => "Check the Application ID, then Discord itself.",
+    }
 }
 
 /// The Application ID field: an optional override for the built-in application.
@@ -95,13 +127,10 @@ fn field_row(s: &Ui, p: Palette, enabled: bool) -> El {
     // The check means the presence is being published under a valid application: the built-in
     // one when the field is empty, or the typed override.
     let in_use = enabled && client_id_is_usable(typed);
+    let ok = client_id_is_usable(typed);
     let mut field = row()
         .w_full()
-        .h(40.0)
-        .px(12.0)
-        .radius(8.0)
-        .fill(p.bg)
-        .border(1.0, p.border)
+        .gap(8.0)
         .center_y()
         .child(
             text_input(&s.discord_client_id, TextStyle::new(13.0, 400.0))
@@ -116,94 +145,45 @@ fn field_row(s: &Ui, p: Palette, enabled: bool) -> El {
     if in_use {
         field = field.child(icon(&ICON_CHECK, 14.0).color(p.accent));
     }
-    col()
-        .w_full()
-        .gap(4.0)
-        .child(
-            text("Application ID (optional override)")
-                .font(SMALL)
-                .color(p.dim),
+    let hint = if ok {
+        format!(
+            "Empty uses tsun's built-in application ({}). Set your own Application ID only to use \
+             your own application's name, icon or art assets.",
+            crate::discord::effective_client_id("")
         )
-        .child(field)
-        .child(
-            text(format!(
-                "Empty uses tsun's built-in application ({}). Set your own Application ID only \
-                 if you want your own application's name, icon or art assets.",
-                crate::discord::effective_client_id("")
-            ))
-            .font(SMALL)
-            .color(p.faint)
-            .wrap_anywhere(),
-        )
+    } else {
+        "An Application ID is 17 to 20 digits, or empty for the built-in application.".to_owned()
+    };
+    let colour = if ok { p.faint } else { p.danger };
+    w::field_row_with(
+        p,
+        "Application ID",
+        w::field_frame(field, p),
+        Some((&hint, colour)),
+    )
 }
 
 /// The "Activity name" field: what Discord shows after "Listening to".
 fn activity_name_row(s: &Ui, p: Palette) -> El {
-    col()
+    let field = row()
         .w_full()
-        .gap(4.0)
-        .child(
-            text("Activity name")
-                .font(SMALL)
-                .color(p.dim),
-        )
-        .child(
-            row()
-                .w_full()
-                .h(40.0)
-                .px(12.0)
-                .radius(8.0)
-                .fill(p.bg)
-                .border(1.0, p.border)
-                .center_y()
-                .child(
-                    text_input(&s.discord_activity_name, TextStyle::new(13.0, 400.0))
-                        .key("discord-activity-name")
-                        .single_line()
-                        .grow(1.0)
-                        .color(p.text)
-                        .placeholder("{title} – {artist}", p.faint)
-                        .on_edit(|s: &mut Ui| &mut s.discord_activity_name)
-                        .on_submit(|s: &mut Ui, _: &mut rune::Tx| s.commit_discord_activity_name()),
-                ),
-        )
-        .child(
-            text("Shown after \"Listening to\". {title}, {artist} and {album} are filled in from the playing track. Leave empty to use the application's own name.")
-                .font(SMALL)
-                .color(p.faint)
-                .wrap_anywhere(),
-        )
-}
-
-/// The live status line: the client thread's own state, or the reason there is none.
-fn status_row(s: &Ui, p: Palette) -> El {
-    let status = s.discord_status.clone().unwrap_or(Status::NotRunning);
-    let colour = if status.is_connected() {
-        p.accent
-    } else if matches!(status, Status::Error(_)) {
-        p.danger
-    } else {
-        p.dim
-    };
-    let hint = match &status {
-        Status::Connected(_) => "Your Discord friends see the current track.",
-        Status::Connecting => "Looking for the Discord client on this machine.",
-        Status::NotRunning => "Start the Discord desktop app and tsun will connect.",
-        Status::Error(_) => "Check the Application ID, then Discord itself.",
-    };
-    row()
-        .key("discord-status")
-        .label(status.label())
-        .w_full()
-        .pt(6.0)
-        .gap(8.0)
         .center_y()
-        .child(el().size(6.0, 6.0).radius(3.0).fill(colour))
         .child(
-            col().grow(1.0).min_w(0.0).gap(2.0)
-                .child(text(status.label()).font(BODY).color(colour))
-                .child(text(hint).font(SMALL).color(p.dim).wrap_anywhere()),
-        )
+            text_input(&s.discord_activity_name, TextStyle::new(13.0, 400.0))
+                .key("discord-activity-name")
+                .single_line()
+                .grow(1.0)
+                .color(p.text)
+                .placeholder("{title} – {artist}", p.faint)
+                .on_edit(|s: &mut Ui| &mut s.discord_activity_name)
+                .on_submit(|s: &mut Ui, _: &mut rune::Tx| s.commit_discord_activity_name()),
+        );
+    w::field_row(
+        p,
+        "Activity name",
+        w::field_frame(field, p),
+        Some("Shown after \"Listening to\". {title}, {artist} and {album} come from the playing track; empty uses the application's own name."),
+    )
 }
 
 impl Ui {
@@ -337,53 +317,6 @@ impl Ui {
         }
         self.discord_config = None;
     }
-}
-
-fn card(p: Palette) -> El {
-    col().w_full().max_w(620.0).padding(16.0).gap(6.0).radius(10.0)
-        .fill(p.card).border(1.0, p.border)
-}
-
-fn section(title: &str, p: Palette) -> El {
-    text(title).font(CAPS).color(p.faint)
-}
-
-/// A boolean row with a check that flips when the row is pressed.
-fn toggle_row(
-    p: Palette,
-    key: &str,
-    title: &str,
-    detail: &str,
-    on: bool,
-    on_press: impl Fn(&mut Ui) + 'static,
-) -> El {
-    row()
-        .key(key)
-        .role("button")
-        .label(title)
-        .w_full()
-        .padding(10.0)
-        .gap(12.0)
-        .center_y()
-        .radius(6.0)
-        .fill(Color::TRANSPARENT)
-        .hover(p.card_hover)
-        .focusable(true)
-        .on_press(on_press)
-        .child(
-            col().grow(1.0).min_w(0.0).gap(2.0)
-                .child(text(title).font(TRACK).color(p.text))
-                .child(text(detail).font(SMALL).color(p.dim).wrap_anywhere()),
-        )
-        .child(check(p, on))
-}
-
-/// A check mark, bright when `on`.
-fn check(p: Palette, on: bool) -> El {
-    el().size(20.0, 20.0).center().radius(10.0)
-        .fill(if on { p.accent } else { Color::TRANSPARENT })
-        .border(1.0, if on { p.accent } else { p.border })
-        .child(icon(&ICON_CHECK, 12.0).color(if on { p.accent_ink } else { p.faint }))
 }
 
 #[cfg(test)]

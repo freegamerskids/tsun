@@ -126,8 +126,8 @@ fn queue_row(s: &Ui, p: Palette, track: &crate::tidal::Track, current: bool) -> 
         .hover(p.card_hover)
         .focusable(true)
         .on_press(move |s: &mut Ui| s.play_queue_index(queue_index(s, id)))
-        .on_secondary_press(move |s: &mut Ui, _: rune::PointerPress, _: &mut rune::Tx| {
-            s.open_menu(MenuState::track(anchor.clone(), for_press.clone()))
+        .on_secondary_press(move |s: &mut Ui, press: rune::PointerPress, _: &mut rune::Tx| {
+            s.open_menu(MenuState::track(anchor.clone(), for_press.clone()).at(press))
         });
     let mut text_col = col().grow(1.0).min_w(0.0).gap(2.0)
         .child(text(track.title.clone()).font(TRACK).color(if current { p.accent } else { p.text }).truncate())

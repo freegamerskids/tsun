@@ -2,6 +2,14 @@
 //! behaviour. This is pure state with no UI or audio dependencies, so next/previous, shuffle,
 //! repeat and removal are all unit-testable in isolation. The UI reads it to draw the queue
 //! panel and the transport, and drives it when the user presses skip or a track ends.
+//!
+//! It also builds the *upcoming order* the worker keeps: the ordered [`Upcoming`] tracks a
+//! natural end will move to, so the worker can advance (and preload for gapless playback) with
+//! no UI frame at all — a covered window gets no frame callbacks, and playback must not stop
+//! because of it. [`upcoming_ids`] is that order as plain ids and [`UpcomingQueue`] is the
+//! worker's copy of it.
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -298,25 +306,6 @@ impl Queue {
         self.skip_next()
     }
 
-    /// The track a natural end would move to, without moving. `None` when playback would stop.
-    /// Used to preload the next track for a gapless hand-off.
-    pub(crate) fn peek_advance(&self) -> Option<&Track> {
-        if self.repeat == Repeat::One {
-            self.current()
-        } else {
-            self.peek_next()
-        }
-    }
-
-    /// The track a manual skip would move to, without moving.
-    pub(crate) fn peek_next(&self) -> Option<&Track> {
-        match self.index {
-            Some(current) if current + 1 < self.order.len() => self.order.get(current + 1),
-            Some(_) if self.repeat == Repeat::All => self.order.first(),
-            _ => None,
-        }
-    }
-
     pub(crate) fn has_next(&self) -> bool {
         match self.index {
             Some(current) => {
@@ -357,6 +346,147 @@ impl Queue {
         shuffle_slice(tail, seed);
     }
 
+}
+
+// ---------------------------------------------------------------------------------------------
+// The upcoming order the worker advances through by itself
+
+/// The shortest upcoming list the UI hands the worker. Enough to cover a queue of that length
+/// without a refill (a covered window gets no frames at all, so nothing refills it), and used as
+/// the minimum for the repeat modes, whose lists the worker repeats itself.
+pub(crate) const UPCOMING_LIMIT: usize = 25;
+
+/// Where the worker gets one upcoming track's audio from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum UpcomingSource {
+    /// A TIDAL track: resolved and started exactly as `Cmd::Play` does.
+    Tidal,
+    /// A local file, opened directly exactly as `Cmd::PlayLocal` does.
+    Local {
+        path: PathBuf,
+        /// The quality label the player bar shows for the file.
+        quality: String,
+        /// Its ReplayGain multiplier, applied when normalization is on.
+        replaygain: Option<f32>,
+    },
+}
+
+/// One track the worker can start by itself when the current one ends, so a natural end does
+/// not need the UI thread to run a frame. The [`Track`] carries everything the UI needs to draw
+/// the track once it catches up; [`UpcomingSource`] carries what the audio side needs.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Upcoming {
+    pub(crate) track: Track,
+    pub(crate) source: UpcomingSource,
+}
+
+impl Upcoming {
+    pub(crate) fn id(&self) -> u64 {
+        self.track.id
+    }
+
+    /// Whether this track is a local file (the gapless hand-off only works within one side).
+    pub(crate) fn is_local(&self) -> bool {
+        matches!(self.source, UpcomingSource::Local { .. })
+    }
+}
+
+/// The ids a natural end would move to, in order.
+///
+/// The worker must be able to keep playing on its own for as long as the window is not being
+/// drawn, so the list is not a short window but the whole future the queue knows:
+///
+/// * repeat-off: every track after the current one, so nothing is left out,
+/// * repeat-one: the current track `limit` times (the worker repeats the list),
+/// * repeat-all: whole cycles of the queue, at least `limit` entries — a list that stopped
+///   mid-cycle would restart rotated and play a track twice at the seam.
+///
+/// Empty when playback would stop, which is how the worker knows it has nothing to advance to.
+pub(crate) fn upcoming_ids(queue: &Queue, limit: usize) -> Vec<u64> {
+    let Some(index) = queue.index else { return Vec::new() };
+    if queue.order.is_empty() || index >= queue.order.len() {
+        return Vec::new();
+    }
+    match queue.repeat {
+        Repeat::One => vec![queue.order[index].id; limit.max(1)],
+        Repeat::Off => queue.order[index + 1..].iter().map(|track| track.id).collect(),
+        Repeat::All => {
+            let period = queue.order.len();
+            let count = period * limit.max(1).div_ceil(period);
+            let mut ids = Vec::with_capacity(count);
+            let mut position = index + 1;
+            while ids.len() < count {
+                ids.push(queue.order[position % period].id);
+                position += 1;
+            }
+            ids
+        }
+    }
+}
+
+/// The worker's copy of the upcoming order: what it plays next on its own, and with which
+/// [`UpcomingSource`]. The list is kept whole with a cursor into it, so [`UpcomingQueue::restart`]
+/// can repeat it for ever under repeat-all/one without copying it again.
+///
+/// The UI sends a fresh list whenever the order can change. The list is derived from the queue,
+/// so it must be reconciled rather than replaced blindly: while a stalled UI is catching up it
+/// resends a tail that already contains tracks the worker has played, and replaying those would
+/// repeat tracks.
+#[derive(Default)]
+pub(crate) struct UpcomingQueue {
+    list: Vec<Upcoming>,
+    next: usize,
+}
+
+impl UpcomingQueue {
+    /// Takes a list the UI built after `after` (the track the UI believes is playing) while the
+    /// worker is on `current`.
+    ///
+    /// When they agree the list is the future and replaces the old one. When they do not — the
+    /// UI has not applied every auto-advance yet — everything up to and including what the
+    /// worker is already playing is dropped, so the tracks it has already started are not
+    /// played a second time. A list that does not contain `current` at all is taken as it is:
+    /// the UI knows better than a list the worker has already walked past.
+    pub(crate) fn set(&mut self, after: Option<u64>, incoming: Vec<Upcoming>, current: Option<u64>) {
+        self.list = if after.is_some() && after == current {
+            incoming
+        } else if let Some(current) = current {
+            match incoming.iter().position(|entry| entry.id() == current) {
+                Some(position) => incoming[position + 1..].to_vec(),
+                None => incoming,
+            }
+        } else {
+            incoming
+        };
+        self.next = 0;
+    }
+
+    pub(crate) fn head(&self) -> Option<&Upcoming> {
+        self.list.get(self.next)
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<Upcoming> {
+        let entry = self.list.get(self.next)?.clone();
+        self.next += 1;
+        Some(entry)
+    }
+
+    /// Drops the head when it is `id`, for a gapless hand-off that already started it.
+    pub(crate) fn consume(&mut self, id: u64) {
+        if self.head().is_some_and(|entry| entry.id() == id) {
+            self.next += 1;
+        }
+    }
+
+    /// Starts the list over, so a repeat mode can keep playing without the UI refilling it.
+    pub(crate) fn restart(&mut self) {
+        self.next = 0;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.list.clear();
+        self.next = 0;
+    }
 }
 
 /// A seed for the shuffle, from the OS when available and from a fixed constant otherwise (a
@@ -626,5 +756,169 @@ mod tests {
         let mut tail = first[1..].to_vec();
         tail.sort_unstable();
         assert_eq!(tail, vec![2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    // ---- the upcoming order the worker advances through on its own ------------------------
+
+    fn upcoming(ids_in: &[u64], start: usize, limit: usize) -> Vec<u64> {
+        upcoming_ids(&build(ids_in, start), limit)
+    }
+
+    #[test]
+    fn upcoming_off_is_the_tail_and_ends_with_the_queue() {
+        assert_eq!(upcoming(&[1, 2, 3], 0, 25), [2, 3]);
+        assert_eq!(upcoming(&[1, 2, 3], 1, 25), [3]);
+        assert_eq!(upcoming(&[1, 2, 3], 2, 25), Vec::<u64>::new(), "nothing after the last track");
+        assert_eq!(upcoming(&[1], 0, 25), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn upcoming_off_is_never_truncated() {
+        // A frozen UI cannot refill the list, so the whole rest of the queue goes with it: a
+        // window would stop playback at the end of the window instead of the end of the queue.
+        let ids_in: Vec<u64> = (1..=30).collect();
+        let expected: Vec<u64> = (2..=30).collect();
+        assert_eq!(upcoming(&ids_in, 0, 2), expected);
+    }
+
+    #[test]
+    fn upcoming_all_wraps_in_whole_cycles() {
+        // Three cycles of a three-track queue: a whole number of passes, so the worker can
+        // repeat the list for ever without the seam playing a track twice.
+        let mut queue = build(&[1, 2, 3], 2);
+        queue.set_repeat(Repeat::All);
+        assert_eq!(
+            upcoming_ids(&queue, 9),
+            [1, 2, 3, 1, 2, 3, 1, 2, 3]
+        );
+        assert_eq!(upcoming_ids(&queue, 1), [1, 2, 3], "at least one whole cycle");
+        assert_eq!(upcoming_ids(&queue, 4), [1, 2, 3, 1, 2, 3], "two cycles cover four");
+
+        let mut single = build(&[7], 0);
+        single.set_repeat(Repeat::All);
+        assert_eq!(upcoming_ids(&single, 3), [7, 7, 7], "one track repeats for ever");
+    }
+
+    #[test]
+    fn upcoming_one_repeats_the_current_id() {
+        let mut queue = build(&[1, 2, 3], 1);
+        queue.set_repeat(Repeat::One);
+        assert_eq!(upcoming_ids(&queue, 3), [2, 2, 2]);
+        assert_eq!(upcoming_ids(&queue, 0), [2], "at least one entry, so the list can repeat");
+    }
+
+    #[test]
+    fn upcoming_is_empty_with_nothing_selected() {
+        let mut queue = build(&[1, 2, 3], 0);
+        queue.clear();
+        assert_eq!(upcoming_ids(&queue, 25), Vec::<u64>::new());
+
+        let mut unstarted = Queue::new();
+        unstarted.push_back_many(vec![track(1), track(2)]);
+        assert_eq!(upcoming_ids(&unstarted, 25), Vec::<u64>::new(), "nothing is playing yet");
+    }
+
+    #[test]
+    fn upcoming_follows_the_shuffled_order() {
+        let mut queue = build(&[1, 2, 3, 4, 5, 6, 7, 8], 0);
+        queue.reshuffle_after_current_with(42);
+        // Whatever the shuffle produced, the upcoming order is the queue's own tail.
+        assert_eq!(upcoming_ids(&queue, 25), ids(&queue)[1..].to_vec());
+    }
+
+    #[test]
+    fn upcoming_tracks_queue_edits() {
+        // "Play next" lands right after the current track.
+        let mut queue = build(&[1, 2, 3], 1);
+        queue.insert_next(track(9));
+        assert_eq!(upcoming_ids(&queue, 25), [9, 3]);
+
+        // "Add to queue" lands at the end.
+        queue.push_back(track(4));
+        assert_eq!(upcoming_ids(&queue, 25), [9, 3, 4]);
+
+        // A queue reorder moves what comes next.
+        assert!(queue.move_item(4, 2), "the appended track moves to come next");
+        assert_eq!(ids(&queue), [1, 2, 4, 9, 3]);
+        assert_eq!(upcoming_ids(&queue, 25), [4, 9, 3]);
+
+        // Turning shuffle off restores the remembered order.
+        queue.set_shuffle(true);
+        queue.set_shuffle(false);
+        assert_eq!(upcoming_ids(&queue, 25), [4, 9, 3]);
+    }
+
+    fn entry(id: u64) -> Upcoming {
+        Upcoming { track: track(id), source: UpcomingSource::Tidal }
+    }
+
+    fn upcoming_list(queue: &UpcomingQueue) -> Vec<u64> {
+        queue.list[queue.next..].iter().map(Upcoming::id).collect()
+    }
+
+    #[test]
+    fn the_worker_takes_a_fresh_list_when_the_ui_is_where_it_is() {
+        let mut list = UpcomingQueue::default();
+        list.set(Some(1), vec![entry(2), entry(3)], Some(1));
+        assert_eq!(upcoming_list(&list), [2, 3]);
+        assert_eq!(list.head().map(Upcoming::id), Some(2));
+        assert_eq!(list.pop().map(|entry| entry.id()), Some(2));
+        assert_eq!(upcoming_list(&list), [3]);
+        assert_eq!(list.head().map(Upcoming::id), Some(3), "one entry is left");
+    }
+
+    #[test]
+    fn a_lagging_ui_does_not_replay_what_the_worker_has_played() {
+        // The UI is on track 1 while the worker has already advanced to 3: the resend (whose
+        // list starts at 2, as the UI built it) must not put 2 and 3 back in the queue.
+        let mut list = UpcomingQueue::default();
+        list.set(Some(1), vec![entry(2), entry(3), entry(4)], Some(3));
+        assert_eq!(upcoming_list(&list), [4]);
+    }
+
+    #[test]
+    fn a_list_the_worker_is_not_in_is_taken_as_it_is() {
+        // The worker's current track is not in the UI's window (it was edited out, or the
+        // window wrapped): the UI's list wins.
+        let mut list = UpcomingQueue::default();
+        list.set(Some(1), vec![entry(5), entry(6)], Some(9));
+        assert_eq!(upcoming_list(&list), [5, 6]);
+
+        // …and with nothing playing at all the whole list is kept.
+        list.set(None, vec![entry(7), entry(8)], None);
+        assert_eq!(upcoming_list(&list), [7, 8]);
+        list.clear();
+        assert!(list.head().is_none());
+        assert_eq!(list.pop().map(|entry| entry.id()), None);
+    }
+
+    #[test]
+    fn a_gapless_hand_off_consumes_its_head() {
+        let mut list = UpcomingQueue::default();
+        list.set(Some(1), vec![entry(2), entry(3)], Some(1));
+        list.consume(2);
+        assert_eq!(upcoming_list(&list), [3]);
+        // A stale hand-off for something else leaves the list alone.
+        list.consume(9);
+        assert_eq!(upcoming_list(&list), [3]);
+    }
+
+    #[test]
+    fn the_worker_can_repeat_the_very_same_list() {
+        // What repeat-all and repeat-one need: a drained list starts over, unchanged.
+        let mut list = UpcomingQueue::default();
+        list.set(Some(1), vec![entry(2), entry(3), entry(2)], Some(1));
+        for _ in 0..2 {
+            assert_eq!(list.pop().map(|entry| entry.id()), Some(2));
+            assert_eq!(list.pop().map(|entry| entry.id()), Some(3));
+            assert_eq!(list.pop().map(|entry| entry.id()), Some(2));
+            assert_eq!(list.pop().map(|entry| entry.id()), None, "drained");
+            list.restart();
+        }
+        assert_eq!(upcoming_list(&list), [2, 3, 2]);
+        // Clearing leaves nothing to repeat, so a repeat mode cannot spin on an empty list.
+        list.clear();
+        list.restart();
+        assert_eq!(list.pop().map(|entry| entry.id()), None);
     }
 }

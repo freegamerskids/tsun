@@ -2,11 +2,11 @@
 //! Discord).
 //!
 //! Everything is emitted from the *app-level* now-playing lifecycle in [`crate::app`] — where
-//! `NowPlaying` is set or cleared, pause/resume, seek, the gapless hand-off, a natural end, a
-//! stop and signing out — so a TIDAL track and a local file produce the same events and no
-//! integration has to know where the audio came from. Each integration keeps a channel to its
-//! own worker thread, so [`Ui::emit_media`] only ever hands the event over and never blocks the
-//! frame.
+//! `NowPlaying` is set or cleared, pause/resume, seek, the worker's own auto-advance (gapless or
+//! not), a natural end, a stop and signing out — so a TIDAL track and a local file produce the
+//! same events and no integration has to know where the audio came from. Each integration keeps
+//! a channel to its own worker thread, so [`Ui::emit_media`] only ever hands the event over and
+//! never blocks the frame.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +30,7 @@ pub(crate) struct MediaTrack {
 /// A change in the playback lifecycle. Positions are the track's own elapsed seconds.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MediaEvent {
-    /// A track started (from the queue, a manual pick, a gapless hand-off or a repeat).
+    /// A track started (from the queue, a manual pick, the worker's own advance or a repeat).
     Started { track: MediaTrack, position_secs: f64 },
     Paused { position_secs: f64 },
     Resumed { position_secs: f64 },

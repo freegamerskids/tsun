@@ -121,7 +121,7 @@ fn extras(s: &Ui, p: Palette) -> El {
     body
 }
 
-/// The album page's header: its 200pt cover, then the title, artist, year, counts, quality, the
+/// The album page's header: its cover, then the title, artist, year, counts, quality, the
 /// review TIDAL wrote and the transport.
 fn header(s: &Ui, p: Palette) -> El {
     let Some(album) = &s.album else { return el() };
@@ -135,13 +135,18 @@ fn header(s: &Ui, p: Palette) -> El {
         .child(meta(s, album, p))
         .child(review(s, p))
         .child(actions(s, album, p));
+    // Top-aligned, like the details beside it start at the top: bottom alignment left the
+    // cover floating low whenever the review made the details column tall.
     row()
         .w_full()
-        .gap(28.0)
-        .items_end()
-        .child(cover_tile(s, p, album.cover.as_deref(), 200.0))
+        .gap(32.0)
+        .items_start()
+        .child(cover_tile(s, p, album.cover.as_deref(), COVER))
         .child(details)
 }
+
+/// The header cover's size.
+const COVER: f32 = 240.0;
 
 /// The album's review in the header, under the title: TIDAL's prose as a three-line preview, the
 /// source it credits, and — when there is more to read than the preview shows — the "More"

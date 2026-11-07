@@ -14,6 +14,7 @@ use crate::ui::cards::{
 use crate::ui::tracks::{ARTIST_H, ALBUM_H, IndexList, PLAYLIST_H, TRACK_H, VIDEO_H, grid_page, tracks_page};
 use crate::ui::video::{video_carousel, video_card};
 use crate::widgets::{cover_art, play_button, primary_button, secondary_button, section_label, track_count};
+use crate::ui::context_menu::{MenuState, TrackMenu, menu_button};
 
 pub(crate) fn search_content(s: &Ui, p: Palette) -> El {
     let mut content = col()
@@ -319,12 +320,22 @@ fn top_hit(s: &Ui, p: Palette, hit: &TopHit) -> El {
     }
 }
 
-/// A top-results track row: cover, title, artist and the play button. Double-clicking plays the
-/// whole result list from here.
+/// A top-results track row: cover, title, artist, the play button and the "…" menu. Double-
+/// clicking plays the whole result list from here; a right-click opens the menu too.
 fn short_row(s: &Ui, p: Palette, track: &Track, index: usize) -> El {
     let id = track.id;
     let current = s.now_playing.as_ref().is_some_and(|playing| playing.id == id);
     let pending = s.pending_play.as_ref().is_some_and(|playing| playing.id == id);
+    let menu_key = format!("top-track-menu-{id}");
+    let row_menu = TrackMenu {
+        track: track.clone(),
+        list: Some(s.results.shared().rows),
+        index,
+        playlist: None,
+        queue: false,
+    };
+    let click_menu = row_menu.clone();
+    let click_key = menu_key.clone();
     row()
         .key(format!("top-track-{id}"))
         .w_full()
@@ -341,6 +352,9 @@ fn short_row(s: &Ui, p: Palette, track: &Track, index: usize) -> El {
             let start = crate::ui::tracks::row_of(&list, id, index).unwrap_or(index);
             s.play_tracks(list, start);
         })
+        .on_secondary_press(move |s: &mut Ui, _: rune::PointerPress, _: &mut rune::Tx| {
+            s.open_menu(MenuState::track(click_key.clone(), click_menu.clone()))
+        })
         .child(cover_art(s, p, track.cover.as_deref(), Some(48.0)))
         .child(
             col().grow(1.0).min_w(0.0).gap(3.0)
@@ -348,6 +362,7 @@ fn short_row(s: &Ui, p: Palette, track: &Track, index: usize) -> El {
                 .child(text(track.artist.clone()).font(SMALL).color(p.dim).truncate()),
         )
         .child(play_button(s, p, id, &track.title, current, pending))
+        .child(menu_button(p, &menu_key, "Track options", row_menu))
 }
 
 /// The suggestion list shown under the search box while it is focused: recent searches when the

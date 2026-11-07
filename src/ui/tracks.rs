@@ -32,7 +32,7 @@ use crate::app::Ui;
 use crate::theme::{CAPS, ICON_PAUSE, ICON_PLAY, SMALL, TRACK, Palette};
 use crate::tidal::{Album, Artist, FavKind, Track};
 use crate::ui::cards::{columns, cover_tile, heart_button, link_text, quality_badge};
-use crate::ui::context_menu::{TrackMenu, menu_button};
+use crate::ui::context_menu::{MenuState, TrackMenu, menu_button};
 use crate::util::format_duration;
 
 /// The gap between two rows of a page, in points (the track table's own row spacing).
@@ -695,6 +695,14 @@ fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>, covers: bool)
             let start = row_of(&list, id, index).unwrap_or(0);
             s.play_tracks(list.to_vec(), start);
         })
+        .on_secondary_press({
+            // Right-click opens the same menu as the "…" button, anchored to that button.
+            let menu = row_menu.clone();
+            let key = menu_key.clone();
+            move |s: &mut Ui, _: rune::PointerPress, _: &mut rune::Tx| {
+                s.open_menu(MenuState::track(key.clone(), menu.clone()))
+            }
+        })
         .child(number_cell(s, p, index, track, rows));
     // A page that already shows the album's cover above the list leaves it out of every row,
     // so the title column starts right after the number (its column header does the same).
@@ -869,6 +877,30 @@ mod tests {
             }
         }
         panic!("no row covers y = {y}");
+    }
+
+    /// A right-click on a row opens that row's context menu (the same one its "…" button opens),
+    /// for the track it stands for.
+    #[test]
+    fn right_clicking_a_row_opens_its_context_menu() {
+        let _env = crate::settings::lock_config_env();
+        let mut rt = page_of(200);
+        for _ in 0..8 {
+            rt.frame(1.0 / 120.0);
+        }
+        let (key, x, y) = row_at(&rt, 300.0);
+        let expected: u64 = key.strip_prefix("track-").unwrap().parse().unwrap();
+        assert!(rt.state.menu.is_none(), "no menu before the click");
+        rt.pointer_move(x, y);
+        rt.frame(1.0 / 120.0);
+        rt.secondary_down(x, y);
+        rt.secondary_up(x, y);
+        rt.frame(1.0 / 120.0);
+        let menu = rt.state.menu.as_ref().expect("the right-click opened a menu");
+        match &menu.target {
+            crate::ui::context_menu::MenuTarget::Track(track) => assert_eq!(track.track.id, expected),
+            _ => panic!("a track row opens a track menu"),
+        }
     }
 
     /// Main's rule: a local file's row has no heart at all, while a TIDAL row keeps one.

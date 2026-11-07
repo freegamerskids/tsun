@@ -1,34 +1,37 @@
-//! Album page: the header (ALBUM label, title, artist link, year, track count, total
-//! duration, quality badge, the review TIDAL wrote with its More/Less toggle, and the
+//! Album page: the header (200pt cover, ALBUM label, title, artist link, year, track count,
+//! total duration, quality badge, the review TIDAL wrote with its "More" button, and the
 //! Play/Shuffle and favourite controls) and the album's full track table.
 //!
-//! The header draws no cover of its own: the title block starts at the page's left edge, so
-//! the review TIDAL wrote for the album sits right under the title, artist and meta line where
-//! Apple Music puts it. The Credits and Related albums that come with it stay below the track
-//! list.
+//! The header carries the album's cover, so the table's rows do not: every row of an album
+//! shows the same picture, and dropping the cell puts the title column right after the number
+//! whose play button the rows grow on hover (`Page::covers`). The review TIDAL wrote sits under
+//! the title, artist and meta line where Apple Music puts it: a three-line preview, and — when
+//! the text is longer — a "More" button that opens the whole review in a modal. The Credits and
+//! Related albums that come with it stay below the track list.
 
 use rune::{El, Tx, col, el, row, text};
 
 use crate::app::{SearchState, Ui};
 use crate::theme::{BODY, CAPS, H2, HERO, Palette, SMALL, SUBTITLE};
 use crate::tidal::{Album, FavKind};
-use crate::ui::cards::{album_card, heart_button, link_text, quality_badge};
+use crate::ui::cards::{album_card, cover_tile, heart_button, link_text, quality_badge};
 use crate::ui::context_menu::{MenuState, header_menu_button};
 use crate::ui::tracks::{TRACK_H, section, tracks_page};
 use crate::util::{quality_badge as badge_label, total_duration};
 use crate::widgets::{primary_button, secondary_button, track_count};
 
-/// The lines the album's review shows before its "More" button, as Apple Music clamps it.
+/// The lines the album's review shows in the header before its "More" button, as Apple Music
+/// clamps it. The whole text lives in the modal the button opens.
 const REVIEW_LINES: usize = 3;
 /// The width the review wraps at: a paragraph, not a banner across a wide window.
 const REVIEW_W: f32 = 640.0;
 /// How many characters a review may hold and still fit three lines at [`REVIEW_W`]. The count is
 /// deliberately above what three lines really hold (roughly 90 characters each at this width and
-/// text style), so a "More" button never promises text that is already visible — and a review
-/// between the two lengths simply draws its own lines, with no clamp and no button.
+/// text style), so a "More" button never promises text that the preview already shows — and a
+/// review between the two lengths simply draws its own lines, with no clamp and no button.
 const REVIEW_LONG: usize = 320;
 
-/// Whether a review is long enough to clamp to [`REVIEW_LINES`] with a "More" button.
+/// Whether a review is long enough to clamp to [`REVIEW_LINES`] behind a "More" button.
 pub(crate) fn review_is_long(text: &str) -> bool {
     text.chars().count() > REVIEW_LONG
 }
@@ -39,6 +42,8 @@ pub(crate) fn album_content(s: &Ui, p: Palette) -> El {
     }
     let rows = s.album_tracks.shared();
     let mut page = tracks_page("album-content", rows.clone(), !rows.rows.is_empty(), TRACK_H)
+        // The cover is in the header: the rows would repeat it.
+        .covers(false)
         .leading(section("header", header).after(27.0));
     match &s.album_state {
         SearchState::Idle | SearchState::Searching => {
@@ -116,12 +121,12 @@ fn extras(s: &Ui, p: Palette) -> El {
     body
 }
 
-/// The album page's header: title, artist, year, counts, quality, the review TIDAL wrote and
-/// the transport. No cover of its own, so the title block starts at the page's left edge.
+/// The album page's header: its 200pt cover, then the title, artist, year, counts, quality, the
+/// review TIDAL wrote and the transport.
 fn header(s: &Ui, p: Palette) -> El {
     let Some(album) = &s.album else { return el() };
-    col()
-        .w_full()
+    let details = col()
+        .grow(1.0)
         .min_w(0.0)
         .gap(12.0)
         .child(text("ALBUM").font(CAPS).color(p.dim))
@@ -129,27 +134,31 @@ fn header(s: &Ui, p: Palette) -> El {
         .child(artist(album, p))
         .child(meta(s, album, p))
         .child(review(s, p))
-        .child(actions(s, album, p))
+        .child(actions(s, album, p));
+    row()
+        .w_full()
+        .gap(28.0)
+        .items_end()
+        .child(cover_tile(s, p, album.cover.as_deref(), 200.0))
+        .child(details)
 }
 
-/// The album's review in the header, under the title: TIDAL's prose, the source it credits, and
-/// the "More"/"Less" toggle a long one gets. Nothing at all while TIDAL has no review for the
-/// album (or has not returned one yet), and no toggle for a review that fits in [`REVIEW_LINES`]
-/// lines.
+/// The album's review in the header, under the title: TIDAL's prose as a three-line preview, the
+/// source it credits, and — when there is more to read than the preview shows — the "More"
+/// button that opens the whole review in a modal. Nothing at all while TIDAL has no review for
+/// the album (or has not returned one yet), and no button for a review that fits the preview.
 fn review(s: &Ui, p: Palette) -> El {
-    let Some(id) = s.album.as_ref().map(|album| album.id) else { return el() };
     let Some(review) = s.album_extras.as_ref().and_then(|extras| extras.review.as_ref()) else {
         return el();
     };
     let long = review_is_long(&review.text);
-    let expanded = long && s.album_review_open == Some(id);
     let mut prose = text(review.text.clone())
         .key("album-review")
         .font(BODY)
         .color(p.dim)
         .wrap_anywhere()
         .max_w(REVIEW_W);
-    if long && !expanded {
+    if long {
         prose = prose.max_lines(REVIEW_LINES);
     }
     let mut block = col().w_full().min_w(0.0).gap(6.0).child(prose);
@@ -158,10 +167,8 @@ fn review(s: &Ui, p: Palette) -> El {
     }
     if long {
         block = block.child(
-            link_text(p, if expanded { "Less" } else { "More" }.to_owned(), SMALL, move |s: &mut Ui| {
-                s.album_review_open = if expanded { None } else { Some(id) };
-            })
-            .key("album-review-more"),
+            link_text(p, "More".to_owned(), SMALL, |s: &mut Ui| s.open_album_review())
+                .key("album-review-more"),
         );
     }
     block
@@ -226,18 +233,19 @@ fn actions(s: &Ui, album: &Album, p: Palette) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::init;
+    use crate::app::{Login, Page, init};
     use crate::theme::palette;
     use crate::tidal::{AlbumExtras, AlbumReview, Track};
+    use crate::ui::dialogs::{self, Dialog};
 
     /// The album id the test pages open.
     const ALBUM: u64 = 42;
 
-    /// The More/Less decision: only a review longer than the three lines the clamp shows gets
-    /// the toggle, counted in characters rather than bytes.
+    /// The threshold: only a review longer than the three lines the preview shows gets the
+    /// "More" button, counted in characters rather than bytes.
     #[test]
     fn only_a_long_review_gets_the_more_button() {
-        assert!(!review_is_long(""), "no text, no toggle");
+        assert!(!review_is_long(""), "no text, no button");
         assert!(!review_is_long(&"a".repeat(REVIEW_LONG)), "a review that fits keeps no button");
         assert!(review_is_long(&"a".repeat(REVIEW_LONG + 1)), "one character over it gets one");
         let accented = "é".repeat(REVIEW_LONG);
@@ -245,13 +253,18 @@ mod tests {
         assert!(!review_is_long(&accented), "the count is characters, so accented prose measures the same");
     }
 
-    /// The album page under a full-height root, as the window provides it.
+    /// The album page under a full-height root, with the window's dialog layer under it — the
+    /// page plus whatever modal is open, as the window composes them.
     fn album_view(s: &Ui, _: &mut rune::Cx<Ui>) -> El {
-        col().w_full().h_full().child(album_content(s, palette()))
+        col()
+            .w_full()
+            .h_full()
+            .child(album_content(s, palette()))
+            .child(dialogs::dialog(s, palette()))
     }
 
-    /// An album page whose extras carry `review` as TIDAL's editorial text.
-    fn album_page(review: &str) -> rune::Runtime<Ui> {
+    /// The app's state on an album whose extras carry `review` as TIDAL's editorial text.
+    fn seeded(review: &str) -> Ui {
         let mut s = init();
         s.album = Some(Album {
             id: ALBUM,
@@ -260,13 +273,37 @@ mod tests {
             ..Album::default()
         });
         s.album_state = SearchState::Done;
+        // The window's own view draws the page the state names, so the modal test shows the
+        // album header behind it — and that page draws only for a signed-in session.
+        s.login = Login::LoggedIn;
+        s.page = Page::Album;
         s.album_tracks.set(vec![Track { id: 7, title: "Song".to_owned(), ..Track::default() }]);
         s.album_extras = Some(AlbumExtras {
             review: Some(AlbumReview { text: review.to_owned(), source: Some("TiVo".to_owned()) }),
             ..AlbumExtras::default()
         });
-        let mut rt = rune::Runtime::new(s, album_view, (900.0, 700.0), rune::Env::new(true, 1.0));
+        s
+    }
+
+    /// An album page whose extras carry `review` as TIDAL's editorial text.
+    fn album_page(review: &str) -> rune::Runtime<Ui> {
+        let mut rt =
+            rune::Runtime::new(seeded(review), album_view, (900.0, 700.0), rune::Env::new(true, 1.0));
         for _ in 0..4 {
+            rt.frame(0.0);
+        }
+        rt
+    }
+
+    /// The window's own view with the review modal open, so the scrim, the card and Escape all
+    /// behave as they do in the app.
+    fn review_modal(review: &str) -> rune::Runtime<Ui> {
+        let mut s = seeded(review);
+        s.open_album_review();
+        let mut rt =
+            rune::Runtime::new(s, crate::ui::view, (1120.0, 720.0), rune::Env::new(true, 1.0));
+        rt.on_key = Some(crate::app::on_key);
+        for _ in 0..3 {
             rt.frame(0.0);
         }
         rt
@@ -280,70 +317,128 @@ mod tests {
             .map(|element| (element.rect[3], element.text))
     }
 
-    /// A long review is clamped to three lines behind a "More" button that expands it in place
-    /// and becomes "Less"; a short review has neither.
+    /// The header keeps a three-line preview and never grows: pressing "More" opens the whole
+    /// review in the modal instead, and a review that fits the preview has no button at all.
     #[test]
-    fn a_long_review_clamps_behind_more_and_a_short_one_does_not() {
+    fn a_long_review_previews_three_lines_and_more_opens_the_modal() {
         // `init` reads the settings file, whose directory the environment names.
         let _env = crate::settings::lock_config_env();
         let long = "One two three four five six seven eight. ".repeat(40);
         let mut rt = album_page(&long);
-        let clamped = element(&rt, "album-review").expect("the review is drawn").0;
+        let preview = element(&rt, "album-review").expect("the preview is drawn").0;
         let (_, label) = element(&rt, "album-review-more").expect("a long review gets its More button");
-        assert_eq!(label.as_deref(), Some("More"), "the toggle reads More while collapsed");
+        assert_eq!(label.as_deref(), Some("More"), "the button reads More");
 
-        // Pressing More expands the same block where it stands.
-        let (x, y) = rt.find("album-review-more").expect("the toggle is drawn");
+        // Pressing More opens the modal; the header's preview is untouched.
+        let (x, y) = rt.find("album-review-more").expect("the button is drawn");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..3 {
             rt.frame(1.0 / 120.0);
         }
-        assert_eq!(rt.state.album_review_open, Some(ALBUM), "the header remembers the album it expanded");
-        let expanded = element(&rt, "album-review").expect("the review is still drawn").0;
-        assert!(expanded > clamped, "expanding shows the rest of the review: {clamped} -> {expanded}");
-        let (_, label) = element(&rt, "album-review-more").expect("the toggle stays");
-        assert_eq!(label.as_deref(), Some("Less"), "the toggle reads Less while expanded");
+        let Some(Dialog::AlbumReview(dialog)) = &rt.state.dialog else {
+            panic!("More opens the review modal");
+        };
+        assert_eq!(dialog.text, long, "the modal holds the whole review");
+        assert_eq!(dialog.title, "Album", "and names the album it belongs to");
+        assert_eq!(dialog.artist, "Artist");
+        assert_eq!(dialog.source.as_deref(), Some("TiVo"), "and keeps the source credit");
+        assert_eq!(
+            element(&rt, "album-review").map(|(height, _)| height),
+            Some(preview),
+            "the header preview is unchanged: nothing expands in place"
+        );
 
-        // Pressing Less clamps it back.
-        let (x, y) = rt.find("album-review-more").expect("the toggle is still drawn");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        for _ in 0..3 {
-            rt.frame(1.0 / 120.0);
-        }
-        assert_eq!(rt.state.album_review_open, None, "Less forgets the expanded album");
-        assert_eq!(element(&rt, "album-review").map(|(height, _)| height), Some(clamped), "the review is clamped again");
-
-    // A review that fits: drawn, with no toggle and no clamp.
+        // A review that fits: drawn, with no button.
         let short = album_page("A short note about the album.");
         assert!(element(&short, "album-review-more").is_none(), "a short review shows no More");
         assert!(element(&short, "album-review").is_some(), "but it is drawn");
     }
 
     /// The threshold promise: a review the length of [`REVIEW_LONG`] plus a character really
-    /// does run past the three lines the clamp shows, so its "More" button reveals text. This is
-    /// the check on the characters-per-line estimate behind [`REVIEW_LONG`]; were the estimate
-    /// wrong, the button would appear over text the reader can already see.
+    /// does run past the three lines the preview shows, and the modal then has more text than
+    /// the preview did. This is the check on the characters-per-line estimate behind
+    /// [`REVIEW_LONG`]; were the estimate wrong, the button would appear over text the reader
+    /// can already see. `line` is the height the page gives a one-line review.
     #[test]
     fn a_review_over_the_threshold_is_really_cut() {
         // `init` reads the settings file, whose directory the environment names.
         let _env = crate::settings::lock_config_env();
+        let line = element(&album_page("A short note about the album."), "album-review")
+            .expect("the review is drawn")
+            .0;
         let prose = "The record opens on a slow, patient figure that the band never hurries, \
                      and by the time the second side arrives the whole thing has turned over into \
                      something far stranger than its first minutes suggest. ";
-        let mut review = prose.repeat(8);
-        review = review.chars().take(REVIEW_LONG + 1).collect();
+        let review: String = prose.repeat(8).chars().take(REVIEW_LONG + 1).collect();
         assert!(review_is_long(&review), "the text is one character past the threshold");
         let mut rt = album_page(&review);
-        let clamped = element(&rt, "album-review").expect("the review is drawn").0;
-        rt.state.album_review_open = Some(ALBUM);
+        let preview = element(&rt, "album-review").expect("the preview is drawn").0;
+        assert!(
+            preview > 2.5 * line && preview < 3.6 * line,
+            "the preview is three lines: {preview} against a line of {line}"
+        );
+        rt.state.open_album_review();
         rt.invalidate();
         for _ in 0..3 {
             rt.frame(1.0 / 120.0);
         }
-        let expanded = element(&rt, "album-review").expect("the review is drawn").0;
-        assert!(expanded > clamped, "the clamped review is really cut: {clamped} -> {expanded}");
+        let full = element(&rt, "album-review-text").expect("the modal draws the review").0;
+        assert!(full > preview, "the modal shows more than the preview: {preview} -> {full}");
+    }
+
+    /// The modal as the window draws it — the card, the whole review, its credit and a Close
+    /// button — and the three ways out of it: its own Close button, the scrim, and Escape.
+    #[test]
+    fn the_review_modal_shows_the_whole_text_and_closes_three_ways() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _env = crate::settings::lock_config_env();
+        let text = "One two three four five six seven eight. ".repeat(20);
+        let mut rt = review_modal(&text);
+        assert!(rt.find("album-review-dialog").is_some(), "the card is up");
+        assert!(rt.find("album-review-dialog-close").is_some(), "with its own close button");
+        assert!(
+            rt.elements().into_iter().any(|element| element.text.as_deref() == Some(text.as_str())),
+            "the card draws the whole review"
+        );
+        assert!(rt.find("album-review-more").is_some(), "the header's More stays behind it");
+
+        // Escape closes it.
+        rt.key(rune::KeyEvent { key: rune::Key::Escape, mods: rune::Mods::default() });
+        for _ in 0..2 {
+            rt.frame(1.0 / 120.0);
+        }
+        assert!(rt.state.dialog.is_none(), "Escape closes the modal");
+        assert!(rt.find("dialog-dismiss").is_none(), "and takes the scrim with it");
+
+        // The scrim dismisses it: a press beside the card, on the window's own edge.
+        reopen(&mut rt);
+        rt.pointer_down(20.0, 700.0);
+        rt.pointer_up(20.0, 700.0);
+        for _ in 0..2 {
+            rt.frame(1.0 / 120.0);
+        }
+        assert!(rt.state.dialog.is_none(), "a press on the scrim closes the modal");
+
+        // And so does its own close button.
+        reopen(&mut rt);
+        let (x, y) = rt.find("album-review-dialog-close").expect("the close button is up");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..2 {
+            rt.frame(1.0 / 120.0);
+        }
+        assert!(rt.state.dialog.is_none(), "the card's close button closes the modal");
+    }
+
+    /// Opens the album's review modal again on a runtime that has closed it.
+    fn reopen(rt: &mut rune::Runtime<Ui>) {
+        rt.state.open_album_review();
+        rt.invalidate();
+        for _ in 0..2 {
+            rt.frame(1.0 / 120.0);
+        }
+        assert!(rt.find("album-review-dialog").is_some(), "the modal is up again");
     }
 
     /// An album with no review draws no description block at all.
@@ -358,22 +453,6 @@ mod tests {
             rt.frame(1.0 / 120.0);
         }
         assert!(element(&rt, "album-review").is_none(), "nothing to describe");
-        assert!(element(&rt, "album-review-more").is_none(), "and no toggle");
-    }
-
-    /// The expanded state belongs to one album: opening another starts it collapsed again.
-    #[test]
-    fn the_expanded_review_does_not_follow_to_another_album() {
-        // `init` reads the settings file, whose directory the environment names.
-        let _env = crate::settings::lock_config_env();
-        let mut s = init();
-        s.album = Some(Album { id: 1, ..Album::default() });
-        s.album_review_open = Some(1);
-        s.open_album(2);
-        assert_eq!(s.album_review_open, None, "another album's review starts collapsed");
-        assert_eq!(s.album.as_ref().map(|album| album.id), Some(2), "the page moved to the album");
-        s.album_review_open = Some(2);
-        s.open_album(2);
-        assert_eq!(s.album_review_open, Some(2), "reopening an album keeps the state the user left");
+        assert!(element(&rt, "album-review-more").is_none(), "and no More button");
     }
 }

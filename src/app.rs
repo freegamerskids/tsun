@@ -27,7 +27,7 @@ use crate::tidal::{
     LyricsData, Mix, Playlist, Profile, Quality, SearchAll, Section, Track, Video, VideoStream,
 };
 use crate::ui::context_menu::MenuState;
-use crate::ui::dialogs::{Dialog, TrackInfo};
+use crate::ui::dialogs::{AlbumReviewDialog, Dialog, TrackInfo};
 use crate::ui::tracks::{Derived, DerivedLibrary, DerivedTracks, Tracks};
 use crate::video;
 use crate::worker::worker;
@@ -424,9 +424,6 @@ pub(crate) struct Ui {
     pub(crate) album_state: SearchState,
     /// The open album's review, credits and related albums, once loaded.
     pub(crate) album_extras: Option<AlbumExtras>,
-    /// The album whose header review is expanded by its "More" button. Keyed by album id, so
-    /// navigating to another album shows its own review collapsed.
-    pub(crate) album_review_open: Option<u64>,
     pub(crate) artist: Option<Artist>,
     pub(crate) artist_page: Option<ArtistPage>,
     pub(crate) artist_state: SearchState,
@@ -715,7 +712,6 @@ pub(crate) fn init() -> Ui {
         album_tracks: Tracks::default(),
         album_state: SearchState::Idle,
         album_extras: None,
-        album_review_open: None,
         artist: None,
         artist_page: None,
         artist_state: SearchState::Idle,
@@ -1889,12 +1885,24 @@ impl Ui {
     /// Opens an album, seeding the header from an [`Album`] the caller already has.
     pub(crate) fn open_album_with(&mut self, album: Album) {
         let id = album.id;
-        if !self.album.as_ref().is_some_and(|open| open.id == id) {
-            // Another album's header starts collapsed: the review's toggle is per album.
-            self.album_review_open = None;
-        }
         self.album = Some(album);
         self.navigate(Route::Album(id));
+    }
+
+    /// Opens the open album's review in a modal, as the header's "More" button does: the whole
+    /// text TIDAL wrote, with the source it credits. Nothing happens when TIDAL has no review
+    /// for the album.
+    pub(crate) fn open_album_review(&mut self) {
+        let Some(album) = &self.album else { return };
+        let Some(review) = self.album_extras.as_ref().and_then(|extras| extras.review.as_ref()) else {
+            return;
+        };
+        self.dialog = Some(Dialog::AlbumReview(AlbumReviewDialog {
+            title: album.title.clone(),
+            artist: album.artist.clone(),
+            text: review.text.clone(),
+            source: review.source.clone(),
+        }));
     }
 
     /// Opens an album by id alone; the header fills in as the page loads.
@@ -2276,8 +2284,6 @@ impl Ui {
     fn load_album(&mut self, id: u64) {
         if !self.album.as_ref().is_some_and(|album| album.id == id) {
             self.album = Some(Album { id, ..Album::default() });
-            // Another album's header starts collapsed: the toggle is per album.
-            self.album_review_open = None;
         }
         self.album_tracks.clear();
         self.album_extras = None;

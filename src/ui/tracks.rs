@@ -40,6 +40,9 @@ const ROW_GAP: f32 = 1.0;
 /// The width of a row's leading cell, which holds its number at rest and its round play button
 /// when the row is hovered, selected or playing. Both fit it, so a hover never moves a column.
 const NUMBER_W: f32 = 24.0;
+/// The size of the cover a track row draws beside its number, and the width its column takes in
+/// the table's column header. A page with [`Page::covers`] off drops the cell from both.
+const COVER_W: f32 = 44.0;
 /// The height a track row lays out at, which pages use as the estimate for rows no layout has
 /// visited yet.
 pub(crate) const TRACK_H: f32 = 56.0;
@@ -292,8 +295,9 @@ impl Section {
 /// What a page's rows are, between its leading and trailing blocks.
 enum Body {
     /// The shared track table: the `#`/`TITLE`/`ALBUM`/`TIME` column header when `columns`,
-    /// then one row per track.
-    Tracks { rows: Rc<[Track]>, columns: bool },
+    /// then one row per track. `covers` draws the 44pt cover cell the table's rows and its
+    /// column header share (the album page turns it off: its cover is in the header).
+    Tracks { rows: Rc<[Track]>, columns: bool, covers: bool },
     /// One row per track, keyed by track id, built by the page's own cell: a list whose rows are
     /// not the shared table (the queue panel).
     TrackRows { rows: Rc<[Track]>, cell: Rc<dyn Fn(&Ui, Palette, usize, &Track) -> El> },
@@ -314,6 +318,8 @@ pub(crate) struct Page {
     /// The body list's generation, else 0.
     generation: u64,
     estimate: f32,
+    /// Whether the shared table's rows draw their own covers (see [`Page::covers`]).
+    covers: bool,
     px: f32,
     pt: f32,
     pb: f32,
@@ -322,7 +328,7 @@ pub(crate) struct Page {
 /// A page holding the shared track table for `list`. `columns` draws the numbered column header
 /// (pass `false` for an empty list, where the page shows a note instead of a table).
 pub(crate) fn tracks_page(key: &str, list: TrackList, columns: bool, estimate: f32) -> Page {
-    Page::new(key, Body::Tracks { rows: list.rows, columns }, list.generation, estimate)
+    Page::new(key, Body::Tracks { rows: list.rows, columns, covers: true }, list.generation, estimate)
 }
 
 /// A page holding one row per track, keyed by track id, built by `cell`: for a list whose rows
@@ -378,6 +384,7 @@ impl Page {
             body,
             generation,
             estimate,
+            covers: true,
             px: PAGE_PX,
             pt: PAGE_PT,
             pb: PAGE_PB,
@@ -411,6 +418,15 @@ impl Page {
         self
     }
 
+    /// Whether the shared table's rows draw their own cover, and its column header keeps the
+    /// cover column (the default). The album page turns it off: its cover is in the header, and
+    /// every row would repeat the same picture, so the title column starts right after the
+    /// number — the column header follows it, so the table stays aligned.
+    pub(crate) fn covers(mut self, covers: bool) -> Self {
+        self.covers = covers;
+        self
+    }
+
     /// The page: a scroll viewport holding the rows list alone. `_s` is the window's state,
     /// which every caller has to hand; the rows themselves are built by rune's own call.
     pub(crate) fn render(&self, _s: &Ui, p: Palette) -> El {
@@ -419,7 +435,9 @@ impl Page {
             leading: self.leading.clone(),
             trailing: self.trailing.clone(),
             body: match &self.body {
-                Body::Tracks { rows, columns } => Body::Tracks { rows: rows.clone(), columns: *columns },
+                Body::Tracks { rows, columns, .. } => {
+                    Body::Tracks { rows: rows.clone(), columns: *columns, covers: self.covers }
+                }
                 Body::TrackRows { rows, cell } => {
                     Body::TrackRows { rows: rows.clone(), cell: cell.clone() }
                 }
@@ -437,6 +455,7 @@ impl Page {
             plan.leading.len(),
             plan.trailing.len(),
             columns,
+            self.covers,
         ));
         let key_plan = plan.clone();
         let build_plan = plan.clone();
@@ -527,7 +546,7 @@ impl Plan {
             return block_row(&self.leading[index], s, p);
         }
         if index < head {
-            return column_header(p);
+            return column_header(p, self.track_covers());
         }
         let len = self.body_len();
         if index < head + len {
@@ -536,9 +555,17 @@ impl Plan {
         block_row(&self.trailing[index - head - len], s, p)
     }
 
+    /// Whether the shared table's rows and its column header draw a cover column.
+    fn track_covers(&self) -> bool {
+        match &self.body {
+            Body::Tracks { covers, .. } => *covers,
+            _ => true,
+        }
+    }
+
     fn body_row(&self, s: &Ui, p: Palette, index: usize) -> El {
         match &self.body {
-            Body::Tracks { rows, .. } => track_row(s, p, index, rows),
+            Body::Tracks { rows, covers, .. } => track_row(s, p, index, rows, *covers),
             Body::TrackRows { rows, cell } => cell(s, p, index, &rows[index]),
             Body::Items { len, per_row, cell } => {
                 let per_row = (*per_row).max(1);
@@ -568,16 +595,18 @@ fn block_row(section: &Section, s: &Ui, p: Palette) -> El {
     block.child((section.build)(s, p))
 }
 
-/// The table's column header, aligned with [`track_row`]'s columns.
-fn column_header(p: Palette) -> El {
-    row()
+/// The table's column header, aligned with [`track_row`]'s columns. `covers` keeps the cover
+/// column, which [`track_row`] then draws in every row.
+fn column_header(p: Palette, covers: bool) -> El {
+    let header = row()
         .w_full()
         .h(30.0)
         .px(12.0)
         .gap(16.0)
         .center_y()
-        .child(text("#").w(24.0).font(CAPS).color(p.faint))
-        .child(el().w(44.0))
+        .child(text("#").w(24.0).font(CAPS).color(p.faint));
+    let header = if covers { header.child(el().w(COVER_W)) } else { header };
+    header
         .child(text("TITLE").grow(4.0).font(CAPS).color(p.faint))
         .child(text("ALBUM").grow(2.0).font(CAPS).color(p.faint))
         .child(text("TIME").w(48.0).font(CAPS).color(p.faint))
@@ -587,9 +616,9 @@ fn column_header(p: Palette) -> El {
 }
 
 /// One track row: the number (or the play button the row shows while it is hovered, selected or
-/// playing), cover, title, artist and album links, duration and quality, the favourite heart and
-/// the "…" menu.
-fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>) -> El {
+/// playing), the cover when the page draws one (`covers`), title, artist and album links,
+/// duration and quality, the favourite heart and the "…" menu.
+fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>, covers: bool) -> El {
     let track = &rows[index];
     let id = track.id;
     let selected = s.selected == Some(id);
@@ -640,7 +669,7 @@ fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>) -> El {
         heart_button(s, p, FavKind::Track, &id.to_string(), 32.0)
     };
     let list = rows.clone();
-    row()
+    let mut line = row()
         .key(format!("track-{id}"))
         .w_full()
         .h(TRACK_H)
@@ -666,8 +695,13 @@ fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>) -> El {
             let start = row_of(&list, id, index).unwrap_or(0);
             s.play_tracks(list.to_vec(), start);
         })
-        .child(number_cell(s, p, index, track, rows))
-        .child(cover_tile(s, p, track.cover.as_deref(), 44.0))
+        .child(number_cell(s, p, index, track, rows));
+    // A page that already shows the album's cover above the list leaves it out of every row,
+    // so the title column starts right after the number (its column header does the same).
+    if covers {
+        line = line.child(cover_tile(s, p, track.cover.as_deref(), COVER_W));
+    }
+    line
         .child(
             col().grow(4.0).min_w(0.0).gap(3.0)
                 .child(text(track.title.clone()).font(TRACK).color(p.text).truncate())
@@ -763,8 +797,19 @@ mod tests {
 
     /// The page under a full-height root, as a page's window provides it.
     fn rows_view(s: &Ui, _: &mut rune::Cx<Ui>) -> El {
+        page_view(s, true)
+    }
+
+    /// The same page with the table's cover column turned off, as the album page does.
+    fn bare_rows_view(s: &Ui, _: &mut rune::Cx<Ui>) -> El {
+        page_view(s, false)
+    }
+
+    fn page_view(s: &Ui, covers: bool) -> El {
         col().w_full().h_full().child(
-            tracks_page("results-page", s.results.shared(), true, TRACK_H).render(s, palette()),
+            tracks_page("results-page", s.results.shared(), true, TRACK_H)
+                .covers(covers)
+                .render(s, palette()),
         )
     }
 
@@ -947,6 +992,67 @@ mod tests {
         rt.pointer_up(bx, by);
         rt.frame(1.0 / 120.0);
         assert_eq!(rt.state.queue.current_id(), Some(expected), "the row's track plays from its place");
+    }
+
+    /// The album page turns the table's covers off: the rows and the column header both drop the
+    /// cover column, so the title starts right after the number — and exactly where the header's
+    /// own TITLE does — while the columns to the right of the growing title/album cells stay put.
+    #[test]
+    fn a_page_without_row_covers_drops_the_column_without_moving_the_others() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _env = crate::settings::lock_config_env();
+        let rect = |rt: &rune::Runtime<Ui>, key: &str| {
+            rt.elements()
+                .into_iter()
+                .find(|element| !element.exiting && element.key.as_deref() == Some(key))
+                .unwrap_or_else(|| panic!("no element keyed {key}"))
+                .rect
+        };
+        let text_at = |rt: &rune::Runtime<Ui>, text: &str| {
+            rt.elements()
+                .into_iter()
+                .find(|element| !element.exiting && element.text.as_deref() == Some(text))
+                .unwrap_or_else(|| panic!("no element showing {text}"))
+                .rect[0]
+        };
+        let page = |view: fn(&Ui, &mut rune::Cx<Ui>) -> El, rows: Tracks| {
+            let mut s = init();
+            s.results = rows;
+            let mut rt = rune::Runtime::new(s, view, (900.0, 700.0), rune::Env::new(true, 1.0));
+            for _ in 0..4 {
+                rt.frame(0.0);
+            }
+            rt
+        };
+        let with = page(rows_view, tracks(40));
+        let without = page(bare_rows_view, tracks(40));
+        // The last 24 rows are the trailing ones either way: layout estimates them at TRACK_H.
+        let row = format!("track-{}", 1_000_000);
+        assert_eq!(
+            rect(&with, &row)[..3],
+            rect(&without, &row)[..3],
+            "the row keeps its place and width"
+        );
+        // The heart closes the row's columns: it does not move when the cover goes.
+        let heart = "heart-track-1000000";
+        assert_eq!(rect(&with, heart)[0], rect(&without, heart)[0], "the columns after the title stay put");
+        // The title column starts one cover (and its gap) earlier, in the row and in the header.
+        let shift = COVER_W + 16.0;
+        assert_eq!(
+            text_at(&with, "Track 0") - text_at(&without, "Track 0"),
+            shift,
+            "the title starts where the cover was"
+        );
+        assert_eq!(
+            text_at(&with, "TITLE") - text_at(&without, "TITLE"),
+            shift,
+            "and the column header follows it"
+        );
+        assert_eq!(
+            text_at(&without, "TITLE"),
+            text_at(&without, "Track 0"),
+            "the row's title sits under the header's TITLE"
+        );
     }
 
     /// The numbers behind the performance note: at 350, 5,000 and 20,000 tracks the first

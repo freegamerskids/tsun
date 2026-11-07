@@ -24,6 +24,17 @@ pub(crate) enum Dialog {
     ConfirmDelete { id: String, title: String },
     /// A track's metadata and credits.
     TrackInfo(TrackInfo),
+    /// The album page's review, in full: the header shows a three-line preview with a "More"
+    /// button, which opens this.
+    AlbumReview(AlbumReviewDialog),
+}
+
+/// An album's review as the modal shows it: the album it belongs to and TIDAL's whole text.
+pub(crate) struct AlbumReviewDialog {
+    pub(crate) title: String,
+    pub(crate) artist: String,
+    pub(crate) text: String,
+    pub(crate) source: Option<String>,
 }
 
 /// A track-info dialog's data: the track, and its credits as they load.
@@ -41,14 +52,61 @@ pub(crate) fn dialog(s: &Ui, p: Palette) -> El {
         Dialog::EditPlaylist { .. } => playlist_form(s, p, "Edit playlist", "Save", "playlist-dialog-submit"),
         Dialog::ConfirmDelete { title, .. } => confirm_delete(p, title),
         Dialog::TrackInfo(info) => track_info(p, info),
+        Dialog::AlbumReview(review) => album_review(p, review),
     }
+}
+
+/// The width of the album-review card: wider than the forms, since it holds prose.
+const REVIEW_W: f32 = 560.0;
+/// The tallest the review's own text gets before it scrolls inside the card.
+const REVIEW_BODY_H: f32 = 380.0;
+
+/// The album's review: which album it is, TIDAL's whole text (scrollable when it is tall), the
+/// source credit and a Close button.
+fn album_review(p: Palette, review: &AlbumReviewDialog) -> El {
+    let mut body = col().w_full().gap(10.0)
+        .child(text(review.artist.clone()).font(SMALL).color(p.dim).w_full().truncate())
+        .child(
+            col()
+                .w_full()
+                .max_h(REVIEW_BODY_H)
+                .shrink()
+                .min_h(0.0)
+                .scroll(ScrollSpec { stick_bottom: false })
+                .child(
+                    text(review.text.clone())
+                        .key("album-review-text")
+                        .font(BODY)
+                        .color(p.text)
+                        .w_full()
+                        .wrap_anywhere(),
+                ),
+        );
+    if let Some(source) = &review.source {
+        body = body.child(text(format!("Source: {source}")).font(SMALL).color(p.faint));
+    }
+    card_sized(
+        p,
+        "album-review-dialog",
+        &review.title,
+        REVIEW_W,
+        body,
+        row().w_full().items_end()
+            .child(el().grow(1.0))
+            .child(secondary_button(p, "Close", true, |s: &mut Ui, _: &mut Tx| s.close_dialog())),
+    )
 }
 
 /// The shared card shell: a title, the body and a footer row of buttons.
 fn card(p: Palette, key: &str, title: &str, body: El, footer: El) -> El {
+    card_sized(p, key, title, 440.0, body, footer)
+}
+
+/// [`card`] at a given width: the album review holds prose and asks for a wider one.
+fn card_sized(p: Palette, key: &str, title: &str, width: f32, body: El, footer: El) -> El {
     col()
         .key(key.to_owned())
-        .w(440.0)
+        .w(width)
         .gap(16.0)
         .padding(24.0)
         .radius(16.0)

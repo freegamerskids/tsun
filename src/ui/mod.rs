@@ -45,6 +45,16 @@ pub(crate) fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
     if let Some(columns) = cx.layout_with("main", |rect| cards::columns_for_width(rect[2])) {
         s.columns.set(columns);
     }
+    // The top bar's shape follows the same laid-out width: the search shrinks, then collapses to
+    // an icon. A breakpoint read, so a resize only re-runs the view as it crosses one.
+    let (logged_in, tray) = (matches!(&s.login, Login::LoggedIn), s.tray_available);
+    if let Some(mode) = cx.layout_with("main", move |rect| topbar::BarMode::for_width(rect[2], logged_in, tray)) {
+        s.bar_mode.set(mode);
+    }
+    // Below this window width the sidebar, both side panels and a usable main area do not fit.
+    if let Some(narrow) = cx.layout_with("app", |rect| rect[2] < 1280.0) {
+        s.narrow_window.set(narrow);
+    }
     let p = palette();
     let mut body = row()
         .key("body")

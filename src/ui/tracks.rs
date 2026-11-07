@@ -3,7 +3,9 @@
 //!
 //! Rows carry a hover highlight, a favourite heart, and artist and album names that navigate to
 //! their pages. Double-clicking a row plays the whole table from that row through
-//! [`Ui::play_tracks`], so next/previous follow the list the user clicked in.
+//! [`Ui::play_tracks`], so next/previous follow the list the user clicked in. The row's number
+//! becomes a round play button while the row is hovered, selected or playing; pressing it plays
+//! the table from that row, and on the row that is playing it pauses instead.
 //!
 //! Every list of tracks — and every grid of cards — is a [`Page`]: the page's own blocks (its
 //! header, its filter toolbar, a "Top tracks" heading, the trailing sections) and its rows are
@@ -24,10 +26,10 @@ use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use rune::{Color, El, GrowthSpec, ScrollSpec, col, el, row, text};
+use rune::{Color, El, GrowthSpec, ScrollSpec, col, el, icon, row, text};
 
 use crate::app::Ui;
-use crate::theme::{CAPS, SMALL, TRACK, Palette};
+use crate::theme::{CAPS, ICON_PAUSE, ICON_PLAY, SMALL, TRACK, Palette};
 use crate::tidal::{Album, Artist, FavKind, Track};
 use crate::ui::cards::{columns, cover_tile, heart_button, link_text, quality_badge};
 use crate::ui::context_menu::{TrackMenu, menu_button};
@@ -35,6 +37,9 @@ use crate::util::format_duration;
 
 /// The gap between two rows of a page, in points (the track table's own row spacing).
 const ROW_GAP: f32 = 1.0;
+/// The width of a row's leading cell, which holds its number at rest and its round play button
+/// when the row is hovered, selected or playing. Both fit it, so a hover never moves a column.
+const NUMBER_W: f32 = 24.0;
 /// The height a track row lays out at, which pages use as the estimate for rows no layout has
 /// visited yet.
 pub(crate) const TRACK_H: f32 = 56.0;
@@ -581,13 +586,13 @@ fn column_header(p: Palette) -> El {
         .child(el().w(32.0))
 }
 
-/// One track row: its number, cover, title, artist and album links, duration and quality, the
-/// favourite heart and the "…" menu.
+/// One track row: the number (or the play button the row shows while it is hovered, selected or
+/// playing), cover, title, artist and album links, duration and quality, the favourite heart and
+/// the "…" menu.
 fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>) -> El {
     let track = &rows[index];
     let id = track.id;
     let selected = s.selected == Some(id);
-    let current = s.now_playing.as_ref().is_some_and(|playing| playing.id == id);
 
     let artist = track.artist_id.map(|artist_id| Artist {
         id: artist_id,
@@ -646,12 +651,22 @@ fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>) -> El {
         .fill(if selected { p.card } else { Color::TRANSPARENT })
         .hover(p.card_hover)
         .on_press(move |s: &mut Ui| s.selected = Some(id))
+        // The row under the pointer shows its play button: the number is replaced while the
+        // pointer rests here (the leave of the row we were on is ignored, so entering one row
+        // while leaving another always leaves the entered row's id in place).
+        .on_hover_change(move |s: &mut Ui, inside, _tx| {
+            if inside {
+                s.row_hover = Some(id);
+            } else if s.row_hover == Some(id) {
+                s.row_hover = None;
+            }
+        })
         .on_double_press(move |s: &mut Ui| {
             // Find the row's place by id: the row may have been built at another index.
             let start = row_of(&list, id, index).unwrap_or(0);
             s.play_tracks(list.to_vec(), start);
         })
-        .child(text(format!("{}", index + 1)).w(24.0).font(SMALL).color(if current { p.dim } else { p.faint }))
+        .child(number_cell(s, p, index, track, rows))
         .child(cover_tile(s, p, track.cover.as_deref(), 44.0))
         .child(
             col().grow(4.0).min_w(0.0).gap(3.0)
@@ -668,6 +683,66 @@ fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>) -> El {
         .child(quality_cell(p, track))
         .child(favourite)
         .child(menu_button(p, &menu_key, "Track options", row_menu))
+}
+
+/// The row's leading cell: the track's number at rest, and — while the row is hovered, selected
+/// or the track that is playing — the round play button the row shows in its place, as Apple
+/// Music and Spotify do. The button plays the whole table from this row through
+/// [`Ui::play_tracks`], so next/previous follow the list the user pressed in; on the row that is
+/// the current track it pauses (or resumes) instead. Both fill the same [`NUMBER_W`] cell, so a
+/// hover never moves the columns after it.
+fn number_cell(s: &Ui, p: Palette, index: usize, track: &Track, rows: &Rc<[Track]>) -> El {
+    let id = track.id;
+    let current = s.now_playing.as_ref().is_some_and(|playing| playing.id == id);
+    // This row's track is the one the worker is opening: the button waits it out rather than
+    // asking for it again.
+    let pending = s.pending_play.as_ref().is_some_and(|playing| playing.id == id);
+    if !(current || pending || s.row_hover == Some(id) || s.selected == Some(id)) {
+        return text(format!("{}", index + 1))
+            .key(format!("number-{id}"))
+            .w(NUMBER_W)
+            .font(SMALL)
+            .color(p.faint);
+    }
+    // The playing row's button pauses; every other row's plays from where it stands.
+    let pause = current && !s.paused;
+    let list = rows.clone();
+    let mut button = el()
+        .key(format!("track-play-{id}"))
+        .role("button")
+        .label(if pause {
+            format!("Pause {}", track.title)
+        } else {
+            format!("Play {} from here", track.title)
+        })
+        .size(NUMBER_W, NUMBER_W)
+        .radius(NUMBER_W / 2.0)
+        .center()
+        .fill(if current { p.accent } else { Color::TRANSPARENT })
+        .hover(if current { p.accent.mix(Color::WHITE, 0.12) } else { p.card_hover })
+        .press(p.accent.alpha(0.25))
+        .focusable(!pending)
+        .disabled(pending)
+        .on_press(move |s: &mut Ui| {
+            // Read the state, not the build: the row may have been built before the track it
+            // stands for started, or before it began playing.
+            if s.now_playing.as_ref().is_some_and(|playing| playing.id == id) {
+                s.toggle_pause();
+            } else if !s.pending_play.as_ref().is_some_and(|playing| playing.id == id) {
+                // Find the row's place by id: the row may have been built at another index.
+                let start = row_of(&list, id, index).unwrap_or(0);
+                s.play_tracks(list.to_vec(), start);
+            }
+        });
+    button = if pending {
+        button.child(text("…").font(SMALL).color(p.dim))
+    } else {
+        button.child(
+            icon(if pause { &ICON_PAUSE } else { &ICON_PLAY }, 13.0)
+                .color(if current { p.accent_ink } else { p.text }),
+        )
+    };
+    button
 }
 
 /// The MAX/HI-RES badge for a row, or an empty cell so the columns stay aligned.
@@ -732,7 +807,7 @@ mod tests {
         rt.elements()
             .into_iter()
             .filter_map(|element| element.key)
-            .filter(|key| key.starts_with("track-") && !key.starts_with("track-menu-"))
+            .filter(|key| key.starts_with("track-") && !key.starts_with("track-menu-") && !key.starts_with("track-play-"))
             .collect()
     }
 
@@ -740,7 +815,7 @@ mod tests {
     fn row_at(rt: &rune::Runtime<Ui>, y: f32) -> (String, f32, f32) {
         for element in rt.elements() {
             let Some(key) = element.key else { continue };
-            if !key.starts_with("track-") || key.starts_with("track-menu-") {
+            if !key.starts_with("track-") || key.starts_with("track-menu-") || key.starts_with("track-play-") {
                 continue;
             }
             let [x, top, _, height] = element.rect;
@@ -821,6 +896,57 @@ mod tests {
             rt.frame(1.0 / 120.0);
         }
         assert_eq!(rt.state.queue.current_id(), Some(expected), "the pressed row's track plays");
+    }
+
+    /// Hovering a row of a long virtual page replaces its number with the play button, without
+    /// moving the columns, and pressing that button plays the track the row stands for — the
+    /// rows above and below it were never built.
+    #[test]
+    fn pressing_the_play_button_of_a_mid_row_plays_that_track() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _env = crate::settings::lock_config_env();
+        let mut rt = page_of(5_000);
+        for _ in 0..8 {
+            rt.frame(1.0 / 120.0);
+        }
+        for _ in 0..60 {
+            rt.wheel(450.0, 400.0, -2_500.0);
+            rt.frame(1.0 / 120.0);
+        }
+        for _ in 0..10 {
+            rt.frame(1.0 / 120.0);
+        }
+        let rect = |rt: &rune::Runtime<Ui>, key: &str| {
+            rt.elements()
+                .into_iter()
+                .find(|element| !element.exiting && element.key.as_deref() == Some(key))
+                .map(|element| element.rect)
+        };
+        let (key, x, y) = row_at(&rt, 350.0);
+        let expected: u64 = key.strip_prefix("track-").unwrap().parse().unwrap();
+        assert!(expected > 1_001_000, "the row is well into the list: {key}");
+        // At rest the row shows its number, and no button at all.
+        let row_before = rect(&rt, &key).expect("the row is mounted");
+        let number = rect(&rt, &format!("number-{expected}")).expect("a resting row shows its number");
+        assert_eq!(number[2], NUMBER_W, "the number's cell is the width a button needs");
+        assert!(rect(&rt, &format!("track-play-{expected}")).is_none(), "no button before the hover");
+        // The pointer rests on the row: the number gives way to the play button.
+        rt.pointer_move(x, y);
+        for _ in 0..3 {
+            rt.frame(1.0 / 120.0);
+        }
+        assert_eq!(rt.state.row_hover, Some(expected), "the row under the pointer is hovered");
+        assert!(rect(&rt, &format!("number-{expected}")).is_none(), "the number gives way to the button");
+        let button = rect(&rt, &format!("track-play-{expected}")).expect("the hovered row shows its play button");
+        // The cell keeps its place and width, so nothing after it moves.
+        assert_eq!(rect(&rt, &key).expect("the row is still mounted"), row_before, "the row does not move");
+        assert_eq!([button[0], button[2]], [number[0], number[2]], "the number's column keeps its width");
+        // Press the button itself: the list plays from this row, though it is deep in the page.
+        let (bx, by) = rt.find(&format!("track-play-{expected}")).unwrap();
+        rt.pointer_down(bx, by);
+        rt.pointer_up(bx, by);
+        rt.frame(1.0 / 120.0);
+        assert_eq!(rt.state.queue.current_id(), Some(expected), "the row's track plays from its place");
     }
 
     /// The numbers behind the performance note: at 350, 5,000 and 20,000 tracks the first

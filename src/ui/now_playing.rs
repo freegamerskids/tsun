@@ -284,8 +284,8 @@ fn transport_block(s: &Ui, p: Palette) -> El {
 }
 
 /// The draggable seek bar; scrolling the whole overlay is never needed, so it may be generous.
+/// Its knob is the player bar's, so both views mark the position the same way.
 fn seek_bar(p: Palette, fraction: f32) -> El {
-    let fraction = fraction.clamp(0.0, 1.0);
     row()
         .key("now-playing-seek")
         .role("slider")
@@ -294,19 +294,14 @@ fn seek_bar(p: Palette, fraction: f32) -> El {
         .h(20.0)
         .center_y()
         .focusable(true)
+        // The knob's ring follows this element's hover, so a drag (which holds the pointer
+        // here) and a hover read the same.
+        .hover_group()
         .on_drag(|s: &mut Ui, d: &mut Drag, _tx: &mut rune::Tx| {
             let fraction = if d.w > 0.0 { d.x / d.w } else { 0.0 };
             s.scrub(fraction, d.phase == Phase::Up);
         })
-        .child(
-            row()
-                .w_full()
-                .h(5.0)
-                .radius(3.0)
-                .fill(p.card_hover)
-                .child(el().grow(fraction.max(0.0001)).h(5.0).radius(3.0).fill(p.text))
-                .child(el().grow((1.0 - fraction).max(0.0001)).h(5.0)),
-        )
+        .child(player_bar::slider_track(p, fraction, 5.0, "now-playing-seek"))
 }
 
 /// A round icon button sized for the full-screen transport.
@@ -416,5 +411,47 @@ mod tests {
         let keys: Vec<String> =
             rt.elements().into_iter().filter_map(|element| element.key).collect();
         assert!(!keys.iter().any(|key| key == "now-playing-heart"), "{keys:?}");
+    }
+
+    /// The full-screen seek bar marks the played position with the same knob the player bar
+    /// draws, so the two views read the position the same way.
+    #[test]
+    fn the_seek_bar_marks_the_played_position_with_a_knob() {
+        let mut s = init();
+        s.now_playing_open = true;
+        s.now_playing = Some(NowPlaying {
+            id: 7,
+            title: "Track".to_owned(),
+            artist: "Artist".to_owned(),
+            album: "Album".to_owned(),
+            cover: None,
+            album_id: None,
+            artist_id: None,
+            elapsed: 90,
+            duration: Some(180),
+            quality: None,
+            output: None,
+        });
+        let mut rt = rune::Runtime::new(s, overlay_view, (1200.0, 800.0), rune::Env::new(true, 1.0));
+        rt.frame(0.0);
+        let rect = |key: &str| {
+            rt.elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some(key))
+                .map(|element| element.rect)
+                .unwrap_or_else(|| panic!("no element keyed {key}"))
+        };
+        let bar = rect("now-playing-seek");
+        let knob = rect("now-playing-seek-knob");
+        assert!(bar[2] > 300.0, "the seek bar spans the middle of the overlay: {}", bar[2]);
+        let centre = knob[0] + knob[2] / 2.0;
+        assert!(
+            (centre - (bar[0] + bar[2] / 2.0)).abs() < 1.5,
+            "90 of 180 seconds is the middle of the bar: the knob is at {centre}, the bar at {bar:?}"
+        );
+        assert!(
+            rt.elements().into_iter().any(|element| element.key.as_deref() == Some("now-playing-seek-ring")),
+            "the hover ring comes with the knob"
+        );
     }
 }

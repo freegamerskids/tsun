@@ -41,6 +41,14 @@ pub(crate) fn settings_content(s: &Ui, p: Palette) -> El {
                 ))
                 .child(toggle_row(
                     p,
+                    "volume-scroll",
+                    "Adjust volume with the mouse wheel",
+                    "Scroll over the volume control to change the volume in 5% steps (1% with Shift). Off, scrolling there never changes it.",
+                    s.settings.volume_scroll,
+                    |s: &mut Ui| s.set_volume_scroll(!s.settings.volume_scroll),
+                ))
+                .child(toggle_row(
+                    p,
                     "desktop-notifications",
                     "Desktop notifications",
                     "Post a notification with the cover art when the track changes.",

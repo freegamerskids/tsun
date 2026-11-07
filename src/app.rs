@@ -403,6 +403,15 @@ pub(crate) struct Ui {
     /// Cards across a carousel or grid, derived from the main area's width by `ui::view` each
     /// frame so cards keep a steady size as the window grows.
     pub(crate) columns: std::cell::Cell<usize>,
+    /// Whether the window is too narrow for the queue and lyrics panels side by side (set by
+    /// `ui::view` from the laid-out window width).
+    pub(crate) narrow_window: std::cell::Cell<bool>,
+    /// How the top bar lays itself out, derived from the main area's laid-out width by
+    /// `ui::view` (a breakpoint read, so a resize only re-runs the view when the mode changes).
+    pub(crate) bar_mode: std::cell::Cell<crate::ui::topbar::BarMode>,
+    /// Whether the search bar is expanded from its collapsed icon button. Only meaningful while
+    /// `bar_mode` is collapsed; Escape or a blur with an empty query collapses it again.
+    pub(crate) search_expanded: bool,
     pub(crate) mix: Option<Mix>,
     pub(crate) mix_tracks: Tracks,
     pub(crate) mix_state: SearchState,
@@ -415,6 +424,9 @@ pub(crate) struct Ui {
     pub(crate) album_state: SearchState,
     /// The open album's review, credits and related albums, once loaded.
     pub(crate) album_extras: Option<AlbumExtras>,
+    /// The album whose header review is expanded by its "More" button. Keyed by album id, so
+    /// navigating to another album shows its own review collapsed.
+    pub(crate) album_review_open: Option<u64>,
     pub(crate) artist: Option<Artist>,
     pub(crate) artist_page: Option<ArtistPage>,
     pub(crate) artist_state: SearchState,
@@ -448,6 +460,10 @@ pub(crate) struct Ui {
     pub(crate) last_query: String,
     pub(crate) results: Tracks,
     pub(crate) selected: Option<u64>,
+    /// The row under the pointer, so a track row can show its play button: the id of the track
+    /// whose row the pointer is inside, cleared when it leaves. Only one row is hovered at a
+    /// time, so the id is enough.
+    pub(crate) row_hover: Option<u64>,
     /// The combined multi-type results of the current search.
     pub(crate) search_all: Option<SearchAll>,
     /// Which results tab the search page shows.
@@ -501,6 +517,9 @@ pub(crate) struct Ui {
     pub(crate) queue_open: bool,
     /// While the progress bar is being dragged: the previewed fraction `0..=1`.
     pub(crate) scrub: Option<f32>,
+    /// Wheel points over the volume control that have not added up to a notch yet, so a
+    /// trackpad's run of small deltas steps the volume at the same rate as a notched wheel.
+    pub(crate) volume_wheel: f32,
     pub(crate) pending_play: Option<NowPlaying>,
     pub(crate) now_playing: Option<NowPlaying>,
     /// The music video playing in the full-screen video view, once TIDAL resolved
@@ -682,6 +701,9 @@ pub(crate) fn init() -> Ui {
         mixes: Vec::new(),
         mix_offset: 0,
         columns: std::cell::Cell::new(4),
+        narrow_window: std::cell::Cell::new(false),
+        bar_mode: std::cell::Cell::new(crate::ui::topbar::BarMode::Field),
+        search_expanded: false,
         mix: None,
         mix_tracks: Tracks::default(),
         mix_state: SearchState::Idle,
@@ -693,6 +715,7 @@ pub(crate) fn init() -> Ui {
         album_tracks: Tracks::default(),
         album_state: SearchState::Idle,
         album_extras: None,
+        album_review_open: None,
         artist: None,
         artist_page: None,
         artist_state: SearchState::Idle,
@@ -720,6 +743,7 @@ pub(crate) fn init() -> Ui {
         last_query: String::new(),
         results: Tracks::default(),
         selected: None,
+        row_hover: None,
         search_all: None,
         search_tab: SearchTab::Top,
         suggestions: Vec::new(),
@@ -750,6 +774,7 @@ pub(crate) fn init() -> Ui {
         queue,
         queue_open: false,
         scrub: None,
+        volume_wheel: 0.0,
         pending_play: None,
         now_playing: None,
         video: None,
@@ -1014,8 +1039,10 @@ pub(crate) fn poll(s: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
         // Art the last frame drew: only what a surface shows is fetched, and a cover that
         // arrives for a row nobody draws does not ask for a repaint (see `Artwork::poll`).
         for (kind, id) in std::mem::take(&mut *s.art_wanted.borrow_mut()) {
-            if let Some(url) = id.strip_prefix("https://") {
-                artwork.request_mix(url);
+            // Mix images are full `images.tidal.com` URLs, not the bare UUIDs of every other
+            // cover; `request_mix` re-checks the host, so no arbitrary URL can be fetched.
+            if id.starts_with("https://") {
+                artwork.request_mix(&id);
                 continue;
             }
             match kind {
@@ -1027,6 +1054,15 @@ pub(crate) fn poll(s: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
         }
     } else {
         s.art_wanted.borrow_mut().clear();
+    }
+    // A collapsed search that lost focus while empty folds back to its icon, so the bar returns
+    // to its compact shape as soon as the user clicks away. While the bar is wide enough for the
+    // field, the collapsed flag means nothing and is dropped.
+    if !s.search_collapsed() {
+        s.search_expanded = false;
+    } else if s.search_expanded && !s.query.focused && s.query.text.is_empty() {
+        s.collapse_search();
+        changed = true;
     }
     changed |= s.tick_local();
     if let Some(covers) = &mut s.covers {
@@ -1853,6 +1889,10 @@ impl Ui {
     /// Opens an album, seeding the header from an [`Album`] the caller already has.
     pub(crate) fn open_album_with(&mut self, album: Album) {
         let id = album.id;
+        if !self.album.as_ref().is_some_and(|open| open.id == id) {
+            // Another album's header starts collapsed: the review's toggle is per album.
+            self.album_review_open = None;
+        }
         self.album = Some(album);
         self.navigate(Route::Album(id));
     }
@@ -2236,6 +2276,8 @@ impl Ui {
     fn load_album(&mut self, id: u64) {
         if !self.album.as_ref().is_some_and(|album| album.id == id) {
             self.album = Some(Album { id, ..Album::default() });
+            // Another album's header starts collapsed: the toggle is per album.
+            self.album_review_open = None;
         }
         self.album_tracks.clear();
         self.album_extras = None;
@@ -2510,6 +2552,29 @@ impl Ui {
         self.page = Page::Explore;
         self.history.push(Route::Explore);
         self.load_explore();
+    }
+
+    /// Whether the top bar has collapsed the search field into its icon button, so the search is
+    /// only up while [`Ui::search_expanded`] is set.
+    pub(crate) fn search_collapsed(&self) -> bool {
+        self.bar_mode.get().is_collapsed()
+    }
+
+    /// Expands the collapsed search icon into the field and focuses it (the top bar's icon
+    /// button). A no-op unless the bar is actually collapsed.
+    pub(crate) fn expand_search(&mut self) {
+        self.search_expanded = true;
+        self.suggest_dismissed = false;
+        self.query.focused = true;
+    }
+
+    /// Puts the collapsed search field back to its icon, clearing focus. The query is kept, so
+    /// reopening restores it.
+    pub(crate) fn collapse_search(&mut self) {
+        self.search_expanded = false;
+        self.query.focused = false;
+        self.suggest_dismissed = true;
+        self.close_suggestions();
     }
 
     fn load_explore(&mut self) {
@@ -2802,14 +2867,21 @@ impl Ui {
         self.now_playing.as_ref().map(|playing| playing.elapsed).unwrap_or(0)
     }
 
-    /// Toggles the right-hand queue panel.
+    /// Toggles the right-hand queue panel. On a narrow window the lyrics panel makes way for
+    /// it: the sidebar plus both panels would leave the main area no width at all.
     pub(crate) fn toggle_queue(&mut self) {
         self.queue_open = !self.queue_open;
+        if self.queue_open && self.narrow_window.get() {
+            self.lyrics_open = false;
+        }
     }
 
-    /// Toggles the lyrics panel.
+    /// Toggles the lyrics panel (and, on a narrow window, closes the queue panel).
     pub(crate) fn toggle_lyrics(&mut self) {
         self.lyrics_open = !self.lyrics_open;
+        if self.lyrics_open && self.narrow_window.get() {
+            self.queue_open = false;
+        }
     }
 
     /// Plays the queue row at `index` (a click in the queue panel).
@@ -2872,15 +2944,32 @@ impl Ui {
     }
 
     /// Records that this frame draws `id` as `kind`, so `poll` fetches it once the frame is
-    /// committed. Cheap and idempotent: an id the cache already holds is not queued, and the
-    /// fetch threads ignore an id they have been asked for before. Only art a surface actually
-    /// draws is ever requested, however long the list behind it is.
+    /// committed. Cheap and idempotent: an id the cache has ever been asked for (in flight,
+    /// decoded or failed) is not queued again, and an id already queued this frame is not
+    /// queued twice. Only art a surface actually draws is ever requested, however long the list
+    /// behind it is.
+    ///
+    /// The first want of a frame also wakes the app. `poll` runs before the view, so a want a
+    /// view notes is only turned into a fetch by the *next* frame's poll; on a cold start with
+    /// nothing else in flight that frame would never come and the covers would stay blank until
+    /// something else moved. Waking here guarantees the poll that drains the want.
     pub(crate) fn want_art(&self, kind: ArtKind, id: Option<&str>) {
         let Some(id) = id else { return };
-        if id.is_empty() || self.artwork.as_ref().is_some_and(|artwork| artwork.get(id).is_some()) {
+        if id.is_empty() || self.artwork.as_ref().is_none_or(|artwork| artwork.knows(id)) {
             return;
         }
-        self.art_wanted.borrow_mut().push((kind, id.to_owned()));
+        let mut wanted = self.art_wanted.borrow_mut();
+        if wanted.iter().any(|(_, queued)| queued == id) {
+            return;
+        }
+        let first = wanted.is_empty();
+        wanted.push((kind, id.to_owned()));
+        drop(wanted);
+        if first {
+            if let Some(wake) = &self.waker {
+                wake();
+            }
+        }
     }
 
     /// The decoded art for `id`, or `None` while it is still loading. Notes the want, so `poll`
@@ -2914,6 +3003,43 @@ impl Ui {
     /// Steps the volume by `delta` (keyboard and wheel).
     pub(crate) fn adjust_volume(&mut self, delta: f32) {
         self.set_volume(self.settings.volume + delta);
+    }
+
+    /// A wheel or trackpad delta over the volume control, when the "Adjust volume with the
+    /// mouse wheel" option is on. `dy` is the delta in points — positive is a roll up, which
+    /// turns the volume up — or the horizontal delta where the platform turned a Shift+wheel
+    /// on its side (see the volume control in `ui::player_bar`). Shift asks for a fine step.
+    ///
+    /// A notched mouse wheel delivers one 40-point line per notch; smaller deltas accumulate,
+    /// so a trackpad's run of many small ones steps at the same rate instead of one step per
+    /// event. The volume clamps at 0 and 1 like any other step.
+    pub(crate) fn wheel_volume(&mut self, dy: f32, fine: bool) {
+        const NOTCH: f32 = 40.0;
+        let step = if fine { 0.01 } else { 0.05 };
+        let mut steps = 0.0;
+        // Turning the wheel back first spends the leftover that way, as the physical wheel does.
+        self.volume_wheel += dy;
+        while self.volume_wheel >= NOTCH {
+            self.volume_wheel -= NOTCH;
+            steps += 1.0;
+        }
+        while self.volume_wheel <= -NOTCH {
+            self.volume_wheel += NOTCH;
+            steps -= 1.0;
+        }
+        if steps != 0.0 {
+            self.adjust_volume(steps * step);
+        }
+    }
+
+    /// Sets whether the mouse wheel over the volume control adjusts the volume, and persists it.
+    /// Off by default: a scroll near the volume bar must leave the volume alone.
+    pub(crate) fn set_volume_scroll(&mut self, on: bool) {
+        if self.settings.volume_scroll == on {
+            return;
+        }
+        self.settings.volume_scroll = on;
+        self.settings.save();
     }
 
     /// Volume while dragging the slider: applied and sent live, unmuting, but written to disk
@@ -3953,6 +4079,25 @@ mod tests {
         if let Some(rx) = &s.cmd_rx {
             assert!(rx.try_recv().is_err(), "no command was issued");
         }
+    }
+
+    /// The sidebar plus the queue and lyrics panels leave a narrow window's main area no width,
+    /// so there the two panels swap; a wide window keeps both.
+    #[test]
+    fn the_queue_and_lyrics_panels_swap_on_a_narrow_window_only() {
+        let mut s = init();
+        s.narrow_window.set(true);
+        s.toggle_queue();
+        s.toggle_lyrics();
+        assert!(s.lyrics_open && !s.queue_open, "lyrics took the place of the queue");
+        s.toggle_queue();
+        assert!(s.queue_open && !s.lyrics_open, "and the queue took it back");
+
+        let mut wide = init();
+        wide.narrow_window.set(false);
+        wide.toggle_queue();
+        wide.toggle_lyrics();
+        assert!(wide.queue_open && wide.lyrics_open, "a wide window shows both");
     }
 }
 

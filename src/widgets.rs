@@ -71,10 +71,11 @@ pub(crate) fn cover_art(s: &Ui, p: Palette, cover: Option<&str>, size: Option<f3
         Some(size) => tile.size(size, size),
         None => tile.w_full().aspect_ratio(1.0),
     };
-    if let Some(image) = cover.and_then(|id| s.artwork.as_ref()?.get(id)).filter(|image| image.is_ready()) {
-        tile.pixels_fit(image.pixels(), rune::SurfaceFit::Fill)
-    } else {
-        tile.center().child(icon(&ICON_NOTE, 18.0).color(p.faint))
+    // Through the shared want scheme, like every other cover: reading the cache alone would
+    // never ask for a cover the first draw missed, leaving rows, thumbnails and mix tiles blank.
+    match s.wanted_art(crate::app::ArtKind::Cover, cover) {
+        Some(image) => tile.pixels_fit(image.pixels(), rune::SurfaceFit::Fill),
+        None => tile.center().child(icon(&ICON_NOTE, 18.0).color(p.faint)),
     }
 }
 

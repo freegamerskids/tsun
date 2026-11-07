@@ -13,6 +13,14 @@ use crate::theme::{
 use crate::tidal::FavKind;
 use crate::widgets::cover_art;
 
+/// The height of the seek and volume slider tracks.
+const BAR: f32 = 4.0;
+/// The diameter of the round dot that marks a slider's value.
+const KNOB: f32 = 10.0;
+/// The diameter of the ring that fades in around the dot while its slider is hovered. A drag
+/// holds the pointer on the slider, so a drag shows it too.
+const KNOB_RING: f32 = 16.0;
+
 /// How far to the left/right the transport buttons sit from the play button.
 pub(crate) fn player_bar(s: &Ui, p: Palette) -> El {
     let playing = s.now_playing.as_ref().or(s.pending_play.as_ref());
@@ -218,9 +226,9 @@ fn transport_area(s: &Ui, p: Palette, playing: Option<&crate::app::NowPlaying>) 
     middle
 }
 
-/// The draggable progress bar: the fraction filled is the live position, or the scrubbed one.
+/// The draggable progress bar: the fraction filled is the live position, or the scrubbed one,
+/// with the value knob on the fill's end.
 fn progress_bar(p: Palette, fraction: f32) -> El {
-    let fraction = fraction.clamp(0.0, 1.0);
     row()
         .key("seek")
         .role("slider")
@@ -229,19 +237,56 @@ fn progress_bar(p: Palette, fraction: f32) -> El {
         .h(16.0)
         .center_y()
         .focusable(true)
+        // The knob's ring follows this element's hover, so a drag (which holds the pointer
+        // here) and a hover read the same.
+        .hover_group()
         .on_drag(|s: &mut Ui, d: &mut Drag, _tx: &mut Tx| {
             let fraction = if d.w > 0.0 { d.x / d.w } else { 0.0 };
             s.scrub(fraction, d.phase == Phase::Up);
         })
+        .child(slider_track(p, fraction, BAR, "seek"))
+}
+
+/// A slider track, shared by the bar's seek and volume sliders and the full-screen seek bar: a
+/// bar `bar` points high, filled to `fraction` in the bright text colour over a dimmer rest,
+/// with the value knob hanging off the fill's right end — where the value lands at any width,
+/// so a bar that grows tracks it too. `key` names the knob for the tests.
+pub(crate) fn slider_track(p: Palette, fraction: f32, bar: f32, key: &str) -> El {
+    let fraction = fraction.clamp(0.0, 1.0);
+    row()
+        .w_full()
+        .h(bar)
+        .radius(bar / 2.0)
+        .fill(p.card_hover)
         .child(
-            row()
-                .w_full()
-                .h(4.0)
-                .radius(2.0)
-                .fill(p.card_hover)
-                .child(el().grow(fraction.max(0.0001)).h(4.0).radius(2.0).fill(p.text))
-                .child(el().grow((1.0 - fraction).max(0.0001)).h(4.0)),
+            el()
+                .grow(fraction.max(0.0001))
+                .h(bar)
+                .radius(bar / 2.0)
+                .fill(p.text)
+                .children(knob(p, bar, key)),
         )
+        .child(el().grow((1.0 - fraction).max(0.0001)).h(bar))
+}
+
+/// The value knob and its hover ring: a round dot pinned to the right edge of the track's fill,
+/// with a translucent ring around it that fades in while the slider is hovered. Both are out of
+/// flow, so neither disturbs the track's layout; `bar` centres them on the track's own height.
+fn knob(p: Palette, bar: f32, key: &str) -> [El; 2] {
+    let ring = el()
+        .key(format!("{key}-ring"))
+        .pin(None, Some((bar - KNOB_RING) / 2.0), Some(-KNOB_RING / 2.0), None)
+        .size(KNOB_RING, KNOB_RING)
+        .radius(KNOB_RING / 2.0)
+        .fill(p.text.alpha(0.25))
+        .group_opacity(0.0, 1.0);
+    let dot = el()
+        .key(format!("{key}-knob"))
+        .pin(None, Some((bar - KNOB) / 2.0), Some(-KNOB / 2.0), None)
+        .size(KNOB, KNOB)
+        .radius(KNOB / 2.0)
+        .fill(p.text);
+    [ring, dot]
 }
 
 /// Volume, lyrics and queue toggles and the quality pill.
@@ -257,7 +302,7 @@ fn right_area(s: &Ui, p: Palette, playing: Option<&crate::app::NowPlaying>) -> E
     } else {
         &ICON_VOLUME_HIGH
     };
-    let volume = row()
+    let mut volume = row()
         .gap(8.0)
         .center_y()
         .child(
@@ -274,6 +319,21 @@ fn right_area(s: &Ui, p: Palette, playing: Option<&crate::app::NowPlaying>) -> E
                 .child(icon(volume_icon, 16.0).color(if s.settings.muted { p.faint } else { p.text })),
         )
         .child(volume_slider(p, if s.settings.muted { 0.0 } else { s.settings.volume }));
+    // With the option off no handler is registered at all, which is what leaves the wheel over
+    // this control to the page: Rune only routes a delta to `on_wheel` where one exists, and
+    // scrolls otherwise.
+    if s.settings.volume_scroll {
+        volume = volume.on_wheel(|s: &mut Ui, ev: rune::WheelEvent, _tx: &mut Tx| {
+            // Linux and Windows turn a Shift+wheel on its side before the app sees it, so read
+            // whichever axis carries the notch; Shift is also what asks for the fine step.
+            let dy = if ev.dy != 0.0 { ev.dy } else if ev.mods.shift { ev.dx } else { 0.0 };
+            if dy != 0.0 {
+                s.wheel_volume(dy, ev.mods.shift);
+            }
+            // The volume control owns the wheel over itself, so a scroll here never pages.
+            true
+        });
+    }
 
     let mut right = row().w(380.0).center_y().justify_end().gap(10.0);
     if !quality.is_empty() {
@@ -318,9 +378,9 @@ fn right_area(s: &Ui, p: Palette, playing: Option<&crate::app::NowPlaying>) -> E
     right
 }
 
-/// The volume slider: the filled part is the current volume, dragged to change it.
+/// The volume slider: the filled part is the current volume, dragged to change it, with the
+/// value knob on the fill's end.
 fn volume_slider(p: Palette, volume: f32) -> El {
-    let volume = volume.clamp(0.0, 1.0);
     el()
         .key("volume")
         .role("slider")
@@ -329,19 +389,14 @@ fn volume_slider(p: Palette, volume: f32) -> El {
         .h(16.0)
         .center_y()
         .focusable(true)
+        // The knob's ring follows this element's hover, so a drag (which holds the pointer
+        // here) and a hover read the same.
+        .hover_group()
         .on_drag(|s: &mut Ui, d: &mut Drag, _tx: &mut Tx| {
             let fraction = if d.w > 0.0 { d.x / d.w } else { 0.0 };
             s.scrub_volume(fraction, d.phase == Phase::Up);
         })
-        .child(
-            row()
-                .w_full()
-                .h(4.0)
-                .radius(2.0)
-                .fill(p.card_hover)
-                .child(el().grow(volume.max(0.0001)).h(4.0).radius(2.0).fill(p.text))
-                .child(el().grow((1.0 - volume).max(0.0001)).h(4.0)),
-        )
+        .child(slider_track(p, volume, BAR, "volume"))
 }
 
 /// A small square icon button; `active` gives it the accent highlight, as the official client
@@ -429,6 +484,73 @@ mod tests {
         rt.frame(0.0);
     }
 
+    /// Points `XDG_CONFIG_HOME` at a scratch directory, so a test that turns the wheel option
+    /// on — which persists it — never touches the user's own settings file.
+    struct ConfigHome {
+        previous: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+        _turn: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ConfigHome {
+        fn new(name: &str) -> ConfigHome {
+            let turn = crate::settings::lock_config_env();
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("tsun-player-bar-{}-{name}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            // SAFETY: `lock_config_env` is held for as long as the environment names this
+            // directory, and the value is restored on drop.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+            ConfigHome { previous, dir, _turn: turn }
+        }
+
+        /// The settings file this test writes, inside its own directory.
+        fn settings_path(&self) -> std::path::PathBuf {
+            self.dir.join("tsun").join("settings.json")
+        }
+    }
+
+    impl Drop for ConfigHome {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The bar, with the volume set the way a user's settings file would have left it.
+    fn runtime_at_volume(volume: f32) -> rune::Runtime<Ui> {
+        let mut rt = runtime();
+        // `update` re-runs the view, and `instant` lands the fill's new width in that frame
+        // instead of springing to it over the frames a `frame(0.0)` would not advance.
+        rt.update(|s, tx| {
+            tx.instant();
+            s.settings.volume = volume;
+        });
+        rt.frame(0.0);
+        rt
+    }
+
+    /// The drawn rect `[x, y, w, h]` and effective opacity of the element keyed `key`.
+    fn element(rt: &rune::Runtime<Ui>, key: &str) -> ([f32; 4], f32) {
+        let found = rt.elements().into_iter().find(|element| element.key.as_deref() == Some(key));
+        let found = found.unwrap_or_else(|| panic!("no element keyed {key}"));
+        (found.rect, found.opacity)
+    }
+
+    fn opacity(rt: &rune::Runtime<Ui>, key: &str) -> f32 {
+        element(rt, key).1
+    }
+
     /// The bar has no stop or expand button; pressing the bare bar opens Now Playing, while a
     /// press on a control inside it does only that control's job.
     #[test]
@@ -471,5 +593,122 @@ mod tests {
             rt.elements().into_iter().filter_map(|element| element.key).collect();
         assert!(!keys.iter().any(|key| key == "player-heart"), "{keys:?}");
         assert!(keys.iter().any(|key| key == "quality-pill"), "the quality pill still shows the file format");
+    }
+
+    /// The volume dot marks the value: at the left end of the track for silence, half way
+    /// across for 50% and at the right end for 100%.
+    #[test]
+    fn the_volume_dot_sits_at_the_current_volume() {
+        let _config = ConfigHome::new("dot");
+        let centre = |volume: f32| {
+            let rt = runtime_at_volume(volume);
+            let (slider, _) = element(&rt, "volume");
+            let (knob, knob_opacity) = element(&rt, "volume-knob");
+            assert_eq!(knob_opacity, 1.0, "the dot is always there to read the volume off");
+            assert!(slider[2] > 90.0, "the volume slider is 96 points wide: {}", slider[2]);
+            (knob[0] + knob[2] / 2.0) - slider[0]
+        };
+        assert!(centre(0.0).abs() < 1.0, "silence is the left end: {}", centre(0.0));
+        assert!((centre(0.5) - 48.0).abs() < 1.5, "50% is half way: {}", centre(0.5));
+        assert!((centre(1.0) - 96.0).abs() < 1.5, "100% is the right end: {}", centre(1.0));
+    }
+
+    /// The seek bar's dot marks the played position the same way, at its own width.
+    #[test]
+    fn the_seek_dot_sits_at_the_played_position() {
+        let _config = ConfigHome::new("seek-dot");
+        let rt = runtime_at_volume(0.5);
+        let (seek, _) = element(&rt, "seek");
+        let (knob, knob_opacity) = element(&rt, "seek-knob");
+        assert_eq!(knob_opacity, 1.0, "the dot is always there to read the position off");
+        assert!(seek[2] > 100.0, "the seek bar spans the middle: {}", seek[2]);
+        // `runtime` plays 6 seconds of a 180-second track.
+        let expected = seek[0] + seek[2] * (6.0 / 180.0);
+        let centre = knob[0] + knob[2] / 2.0;
+        assert!((centre - expected).abs() < 1.5, "the dot is at {centre}, the position at {expected}");
+    }
+
+    /// The ring says the slider is live: it stays out at rest, fades in while the pointer is on
+    /// the slider (a drag holds the pointer there too), and belongs to that slider alone.
+    #[test]
+    fn each_ring_shows_only_while_its_own_slider_is_hovered() {
+        let _config = ConfigHome::new("ring");
+        let mut rt = runtime_at_volume(0.5);
+        assert_eq!(opacity(&rt, "volume-ring"), 0.0, "nothing is hovered yet");
+        assert_eq!(opacity(&rt, "seek-ring"), 0.0, "nothing is hovered yet");
+
+        let (x, y) = rt.find("volume").expect("volume slider");
+        rt.pointer_move(x, y);
+        for _ in 0..120 {
+            rt.frame(1.0 / 120.0);
+        }
+        assert!(opacity(&rt, "volume-ring") > 0.99, "the volume ring is out: {}", opacity(&rt, "volume-ring"));
+        assert_eq!(opacity(&rt, "seek-ring"), 0.0, "the seek ring ignores the volume slider's hover");
+
+        let (x, y) = rt.find("seek").expect("seek bar");
+        rt.pointer_move(x, y);
+        for _ in 0..120 {
+            rt.frame(1.0 / 120.0);
+        }
+        assert!(opacity(&rt, "seek-ring") > 0.99, "the seek ring is out: {}", opacity(&rt, "seek-ring"));
+        assert_eq!(opacity(&rt, "volume-ring"), 0.0, "and the volume ring is back in");
+    }
+
+    /// Off by default, the wheel over the volume control is left to the page: the volume must
+    /// not move, however the wheel turns.
+    #[test]
+    fn the_volume_control_ignores_the_wheel_by_default() {
+        let _config = ConfigHome::new("wheel-off");
+        let mut rt = runtime_at_volume(1.0);
+        assert!(!rt.state.settings.volume_scroll, "the option is off by default");
+        let (x, y) = rt.find("volume").expect("volume slider");
+        for dy in [40.0, 40.0, -120.0] {
+            rt.wheel_event(rune::WheelEvent::new(0.0, dy).at(x, y));
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.settings.volume, 1.0, "a scroll near the volume bar leaves the volume alone");
+    }
+
+    /// With the option on, a notch over the whole control (mute button and slider) steps the
+    /// volume by 5%, Shift asks for 1%, and both ends clamp.
+    #[test]
+    fn the_volume_wheel_option_steps_the_volume_and_clamps() {
+        let config = ConfigHome::new("wheel-on");
+        let mut rt = runtime_at_volume(0.5);
+        rt.update(|s, _| s.set_volume_scroll(true));
+        rt.frame(0.0);
+        assert!(rt.state.settings.volume_scroll, "the option is on");
+        let saved = std::fs::read_to_string(config.settings_path()).expect("the settings file");
+        assert!(saved.contains("\"volume_scroll\": true"), "the choice lands in settings.json: {saved}");
+        let (vx, vy) = rt.find("volume").expect("volume slider");
+        let notch = |rt: &mut rune::Runtime<Ui>, at: (f32, f32), dy: f32| {
+            rt.wheel_event(rune::WheelEvent::new(0.0, dy).at(at.0, at.1));
+            rt.frame(1.0 / 60.0);
+        };
+
+        notch(&mut rt, (vx, vy), 40.0);
+        assert!((rt.state.settings.volume - 0.55).abs() < 1e-6, "one notch up is 5%: {}", rt.state.settings.volume);
+        notch(&mut rt, (vx, vy), -40.0);
+        notch(&mut rt, (vx, vy), -40.0);
+        assert!((rt.state.settings.volume - 0.45).abs() < 1e-6, "two notches down is 10%: {}", rt.state.settings.volume);
+
+        // Shift is the fine step, and on Linux it arrives as a horizontal delta.
+        rt.wheel_event(rune::WheelEvent::new(40.0, 0.0).at(vx, vy).mods(rune::Mods { shift: true, ..Default::default() }));
+        rt.frame(1.0 / 60.0);
+        assert!((rt.state.settings.volume - 0.46).abs() < 1e-6, "Shift is a 1% step: {}", rt.state.settings.volume);
+
+        // The mute button is part of the control, so the wheel works over it too.
+        let (mx, my) = rt.find("volume-mute").expect("mute button");
+        notch(&mut rt, (mx, my), 40.0);
+        assert!((rt.state.settings.volume - 0.51).abs() < 1e-6, "the mute button adjusts too: {}", rt.state.settings.volume);
+
+        rt.update(|s, _| s.set_volume(0.98));
+        rt.frame(0.0);
+        notch(&mut rt, (vx, vy), 40.0);
+        assert_eq!(rt.state.settings.volume, 1.0, "the volume clamps at the top");
+        rt.update(|s, _| s.set_volume(0.02));
+        rt.frame(0.0);
+        notch(&mut rt, (vx, vy), -40.0);
+        assert_eq!(rt.state.settings.volume, 0.0, "and at the bottom");
     }
 }

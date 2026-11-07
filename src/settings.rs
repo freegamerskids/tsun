@@ -86,6 +86,9 @@ pub(crate) struct Settings {
     /// Output volume in `0.0..=1.0` (mute is tracked separately, so unmuting restores it).
     pub(crate) volume: f32,
     pub(crate) muted: bool,
+    /// Whether the mouse wheel over the volume control adjusts the volume. Off by default, so
+    /// scrolling a page with the pointer near the volume bar never changes it.
+    pub(crate) volume_scroll: bool,
     pub(crate) shuffle: bool,
     pub(crate) repeat: Repeat,
     /// Preferred streaming quality; the client requests this tier first.
@@ -134,6 +137,7 @@ impl Default for Settings {
         Settings {
             volume: default_volume(),
             muted: false,
+            volume_scroll: false,
             shuffle: false,
             repeat: Repeat::Off,
             quality: Quality::default(),
@@ -230,6 +234,7 @@ mod tests {
         let settings = Settings {
             volume: 0.4,
             muted: true,
+            volume_scroll: true,
             shuffle: true,
             repeat: Repeat::One,
             quality: Quality::Lossless,
@@ -257,6 +262,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"volume":0.5}"#).unwrap();
         assert_eq!(settings.output_device, None);
         assert!(!settings.notifications);
+        assert!(!settings.volume_scroll, "the mouse wheel stays off unless the file turns it on");
         assert_eq!(settings.startup_page, StartupPage::Home);
         assert_eq!(settings.last_route, None);
         assert!(!settings.close_to_tray);
@@ -269,6 +275,20 @@ mod tests {
             true,
             "the display switches default on even in a partial file"
         );
+    }
+
+    #[test]
+    fn the_volume_wheel_option_defaults_off_and_round_trips() {
+        assert!(!Settings::default().volume_scroll, "the mouse wheel never touches the volume unless asked to");
+        // A hand-written file that names it off, or one written before the field existed, both
+        // keep the wheel out of the volume.
+        assert!(!serde_json::from_str::<Settings>(r#"{"volume_scroll":false}"#).unwrap().volume_scroll);
+        assert!(!serde_json::from_str::<Settings>(r#"{"volume":0.25}"#).unwrap().volume_scroll);
+        let settings = Settings { volume_scroll: true, ..Settings::default() };
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(text.contains("\"volume_scroll\":true"), "{text}");
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert!(back.volume_scroll, "the choice comes back on the next launch");
     }
 
     #[test]

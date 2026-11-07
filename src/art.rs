@@ -276,6 +276,13 @@ impl Artwork {
         became.into_iter().any(|id| shown.contains(&id))
     }
 
+    /// Whether `id` has been requested already — in flight, decoded, or failed. The draw path
+    /// uses this to note a want only for covers the cache has never seen, so a frame that draws
+    /// a row it has drawn before does no work and raises no repaint.
+    pub fn knows(&self, id: &str) -> bool {
+        self.entries.contains_key(id)
+    }
+
     /// The decoded cover for `id`, or `None` while it is still loading, if it failed, or if it
     /// was never requested. Drawing a placeholder while this is `None` is the fallback.
     pub fn get(&self, id: &str) -> Option<&Image> {
@@ -578,5 +585,89 @@ mod tests {
         art.make_room();
         assert!(art.entries.contains_key("id-0"), "the pinned entry stays");
         assert!(art.entries.len() < MAX_ENTRIES, "the map still trims to the ceiling");
+    }
+
+    /// A 2x2 PNG the paint test fetches from disk, so the test needs no network.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00,
+        0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x84, 0x19, 0x60, 0x0c, 0x00,
+        0x47, 0xca, 0x07, 0xf9, 0x67, 0x59, 0x6e, 0xb7, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+        0x60, 0x82,
+    ];
+
+    /// The `file:` cover id the paint test's view draws. A view is a `fn`, so it cannot capture,
+    /// and the initializer also writes the tiny PNG the fetch reads — keeping the whole fixture
+    /// (path and bytes) in one place.
+    static TEST_COVER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let dir = std::env::temp_dir().join("tsun-art-first-paint");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("cover.png");
+        std::fs::write(&path, TINY_PNG).expect("write cover");
+        format!("file:{}", path.display())
+    });
+
+    /// Draws one cover through the shared widget, exactly as the rows, tiles and thumbnails do.
+    fn paint_view(s: &crate::app::Ui, _: &mut rune::Cx<crate::app::Ui>) -> rune::El {
+        rune::col().child(
+            rune::el()
+                .key("cover")
+                .child(crate::widgets::cover_art(s, crate::theme::palette(), Some(TEST_COVER.as_str()), Some(40.0))),
+        )
+    }
+
+    /// Whether the `cover` wrapper still draws its fallback note icon (it is gone once the image
+    /// paints).
+    fn cover_placeholder_up(rt: &rune::Runtime<crate::app::Ui>) -> bool {
+        let elements = rt.elements();
+        let Some(cover) = elements.iter().find(|e| e.key.as_deref() == Some("cover")) else {
+            return false;
+        };
+        let prefix = format!("{}/", cover.path);
+        elements.iter().any(|e| e.path.starts_with(&prefix) && e.role == "icon")
+    }
+
+    /// A cold start draws a cover the cache has never seen: the draw notes the want, wakes the
+    /// app for the poll that turns the want into a fetch, and the cover paints once the fetch and
+    /// its decode land — with no other event (no tap, resize or navigation).
+    #[test]
+    fn a_cover_drawn_on_the_first_frame_is_fetched_and_painted_without_any_other_event() {
+        // Touch the fixture so the tiny PNG exists before the runtime draws the cover.
+        let _ = TEST_COVER.as_str();
+        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = woken.clone();
+        let waker: Waker = Arc::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+
+        // The app's own state and poll: `init` builds the `Ui`, and the artwork cache and waker
+        // are what `setup` would install (without the worker thread a test does not want).
+        let mut s = crate::app::init();
+        s.settings.discord_enabled = false;
+        s.settings.notifications = false;
+        s.artwork = Some(Artwork::new(waker.clone()));
+        s.waker = Some(waker);
+        let mut rt = rune::Runtime::new(s, paint_view, (240.0, 120.0), rune::Env::new(true, 1.0));
+        rt.poll = Some(crate::app::poll);
+
+        // The first frame: `poll` runs before the view, so this frame's draw is one the cache has
+        // never seen. The placeholder stands in, and noting the want woke the app to fetch it.
+        rt.frame(0.0);
+        assert!(cover_placeholder_up(&rt), "the placeholder stands in until the cover arrives");
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "drawing a cover the cache has not seen wakes the app for the poll that fetches it"
+        );
+
+        // From here nothing else happens: the fetch and its decode are the only things that wake
+        // the app, exactly as on a cold start.
+        let mut painted = false;
+        for _ in 0..600 {
+            rt.frame(1.0 / 60.0);
+            if !cover_placeholder_up(&rt) {
+                painted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(painted, "the cover the first frame asked for paints with no other event");
     }
 }

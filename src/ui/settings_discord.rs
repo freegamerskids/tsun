@@ -9,7 +9,7 @@
 use rune::{Color, El, TextStyle, col, el, icon, row, text, text_input};
 
 use crate::app::Ui;
-use crate::discord::{self, Config, Status};
+use crate::discord::{self, Config, Status, client_id_is_usable};
 use crate::theme::{BODY, CAPS, ICON_CHECK, SMALL, TRACK, Palette};
 
 /// The Discord Rich Presence card.
@@ -20,9 +20,9 @@ pub(crate) fn discord_card(s: &Ui, p: Palette) -> El {
         .child(section("Discord Rich Presence", p))
         .child(
             text(
-                "Shows what you are listening to on your Discord profile. It needs your own \
-                 Discord application: create one at discord.com/developers/applications, name it \
-                 TIDAL, and paste its Application ID below.",
+                "Shows what you are listening to on your Discord profile. It works as it is: \
+                 tsun publishes the presence under its own Discord application, so there is \
+                 nothing to sign up for.",
             )
             .font(SMALL)
             .color(p.faint)
@@ -34,16 +34,17 @@ pub(crate) fn discord_card(s: &Ui, p: Palette) -> El {
             p,
             "discord-enabled",
             "Show what I'm listening to",
-            "Publishes the current track as your Discord activity, through the application above.",
+            "Publishes the current track as your Discord activity, through the built-in \
+             application (or the one you name below).",
             enabled,
             |s: &mut Ui| s.set_discord_enabled(!s.settings.discord_enabled),
         ));
     if enabled {
         card = card.child(status_row(s, p));
     }
-    if !typed.is_empty() && !discord::valid_client_id(typed) {
+    if !client_id_is_usable(typed) {
         card = card.child(
-            text("An Application ID is 17 to 20 digits.")
+            text("An Application ID is 17 to 20 digits, or empty for the built-in application.")
                 .font(SMALL)
                 .color(p.danger)
                 .wrap_anywhere(),
@@ -88,10 +89,12 @@ pub(crate) fn discord_card(s: &Ui, p: Palette) -> El {
     card
 }
 
-/// The Application ID field.
+/// The Application ID field: an optional override for the built-in application.
 fn field_row(s: &Ui, p: Palette, enabled: bool) -> El {
-    // The check means the ID is the one being published under, not just that it is typed.
-    let in_use = enabled && discord::valid_client_id(s.discord_client_id.text.trim());
+    let typed = s.discord_client_id.text.trim();
+    // The check means the presence is being published under a valid application: the built-in
+    // one when the field is empty, or the typed override.
+    let in_use = enabled && client_id_is_usable(typed);
     let mut field = row()
         .w_full()
         .h(40.0)
@@ -106,15 +109,32 @@ fn field_row(s: &Ui, p: Palette, enabled: bool) -> El {
                 .single_line()
                 .grow(1.0)
                 .color(p.text)
-                .placeholder("Application ID (17–20 digits)", p.faint)
+                .placeholder("Built-in application (leave empty)", p.faint)
                 .on_edit(|s: &mut Ui| &mut s.discord_client_id)
                 .on_submit(|s: &mut Ui, _: &mut rune::Tx| s.commit_discord_client_id()),
         );
     if in_use {
-        // A hint that the field is what the connection follows, without another control.
         field = field.child(icon(&ICON_CHECK, 14.0).color(p.accent));
     }
-    field
+    col()
+        .w_full()
+        .gap(4.0)
+        .child(
+            text("Application ID (optional override)")
+                .font(SMALL)
+                .color(p.dim),
+        )
+        .child(field)
+        .child(
+            text(format!(
+                "Empty uses tsun's built-in application ({}). Set your own Application ID only \
+                 if you want your own application's name, icon or art assets.",
+                crate::discord::effective_client_id("")
+            ))
+            .font(SMALL)
+            .color(p.faint)
+            .wrap_anywhere(),
+        )
 }
 
 /// The "Activity name" field: what Discord shows after "Listening to".
@@ -219,7 +239,9 @@ impl Ui {
             return;
         }
         let wanted = self.discord_config();
-        if !discord::valid_client_id(&wanted.client_id) {
+        if !discord::client_id_is_usable(&self.settings.discord_client_id) {
+            // A non-empty id that is not 17–20 digits: nothing to connect under, and the card
+            // says so.
             self.stop_discord();
             return;
         }
@@ -253,10 +275,11 @@ impl Ui {
         }
     }
 
-    /// The Application ID field's own configuration.
+    /// The Application ID field's own configuration. A blank field means the built-in
+    /// application, so the client never sees an empty id.
     pub(crate) fn discord_config(&self) -> Config {
         Config {
-            client_id: self.settings.discord_client_id.trim().to_owned(),
+            client_id: discord::effective_client_id(&self.settings.discord_client_id).to_owned(),
             name: self.settings.discord_activity_name.trim().to_owned(),
             show_art: self.settings.discord_show_art,
             show_time: self.settings.discord_show_time,
@@ -372,7 +395,7 @@ mod tests {
     use rune::TextEdit;
     use std::ffi::OsString;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn card_view(s: &Ui, _: &mut rune::Cx<Ui>) -> El {
         discord_card(s, palette())
@@ -454,7 +477,19 @@ mod tests {
         let shown = texts(&rt);
         assert!(shown.iter().any(|text| text == "Connected as ana"), "{shown:?}");
         assert!(shown.iter().any(|text| text.contains("Your Discord friends")), "{shown:?}");
-        assert!(rt.find("discord-client-id").is_some(), "the field is there");
+        assert!(
+            shown.iter().any(|text| text.contains("tsun's built-in application")),
+            "the card says it works with no setup: {shown:?}"
+        );
+        assert!(
+            shown.iter().any(|text| text.contains(crate::discord::DEFAULT_CLIENT_ID)),
+            "the built-in application id is named: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text.contains("create one at discord.com")),
+            "no setup is required any more: {shown:?}"
+        );
+        assert!(rt.find("discord-client-id").is_some(), "the override field is there");
         assert!(rt.find("discord-activity-name").is_some(), "the activity-name field is there");
         assert!(shown.iter().any(|text| text == "Activity name"), "{shown:?}");
         assert!(
@@ -465,7 +500,8 @@ mod tests {
         assert!(rt.find("discord-show-time").is_some());
         assert!(rt.find("discord-button").is_some());
 
-        // A too-short Application ID is called out, and the error state is shown verbatim.
+        // A malformed override is called out; an empty field is not (it means the built-in
+        // application), and the error state is shown verbatim.
         let mut state = init();
         state.settings.discord_enabled = true;
         state.discord_client_id = TextEdit::new("12345");
@@ -477,6 +513,15 @@ mod tests {
         assert!(
             shown.iter().any(|text| text == "Error: Invalid Client ID (4000)"),
             "{shown:?}"
+        );
+        let rt = runtime({
+            let mut state = init();
+            state.settings.discord_enabled = true;
+            state
+        });
+        assert!(
+            !texts(&rt).iter().any(|text| text.contains("17 to 20 digits")),
+            "an empty field is the built-in application, not an error"
         );
 
         // While the feature is off there is no status line at all.
@@ -535,21 +580,59 @@ mod tests {
     }
 
     #[test]
-    fn start_and_stop_follow_the_settings_without_a_valid_application_id() {
-        let _config = ConfigHome::new("start-stop");
+    fn an_empty_id_uses_the_built_in_application_and_never_a_real_discord() {
+        let _config = ConfigHome::new("built-in");
         let mut state = init();
-        // Enabled but no Application ID: no client, and no socket is ever touched.
+        // Enabled with an empty field: the built-in application, exactly what a fresh install
+        // does. The client it starts is confined to the private test path (see
+        // `test_runtime_dir`), so this can never reach the Discord on this machine: it finds no
+        // socket and reports "Not running".
         state.settings.discord_enabled = true;
         state.settings.discord_client_id = String::new();
         state.discord_client_id = TextEdit::new("");
         state.sync_discord();
-        assert!(state.discord.is_none(), "an empty ID cannot start a client");
-        assert!(state.discord_status.is_none());
-        state.settings.discord_client_id = "not-a-number".to_owned();
+        assert_eq!(state.discord_config().client_id, crate::discord::DEFAULT_CLIENT_ID);
+        assert!(state.discord.is_some(), "the built-in application needs no setup");
+        // The thread works down to "Not running": it looked for a socket in the private test
+        // path only, which holds none.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut status = state.discord.as_ref().unwrap().status();
+        while status != Status::NotRunning && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            status = state.discord.as_ref().unwrap().status();
+        }
+        assert_eq!(
+            status,
+            Status::NotRunning,
+            "the private test path holds no Discord socket, and the real one is never searched"
+        );
+        // A malformed override stops it again: nothing to publish under. (The card's field is
+        // what the settings follow, so the field is what changes here.)
+        state.discord_client_id = TextEdit::new("not-a-number");
         state.sync_discord();
-        assert!(state.discord.is_none());
+        assert!(state.settings.discord_client_id == "not-a-number", "the malformed text is kept");
+        assert!(state.discord.is_none(), "a malformed override connects to nothing");
+        assert!(!crate::discord::client_id_is_usable("not-a-number"));
         // Disabling leaves everything stopped.
         state.set_discord_enabled(false);
+        assert!(state.discord.is_none());
+    }
+
+    #[test]
+    fn a_typed_id_overrides_the_built_in_application() {
+        let _config = ConfigHome::new("override");
+        let mut state = init();
+        state.settings.discord_enabled = true;
+        state.discord_client_id = TextEdit::new("12345678901234567");
+        state.settings.discord_client_id = "12345678901234567".to_owned();
+        assert_eq!(state.discord_config().client_id, "12345678901234567");
+        // Clearing the field goes back to the built-in application, without touching the network
+        // (the client is confined to the private test path).
+        state.discord_client_id = TextEdit::new(String::new());
+        state.sync_discord();
+        assert_eq!(state.settings.discord_client_id, "");
+        assert_eq!(state.discord_config().client_id, crate::discord::DEFAULT_CLIENT_ID);
+        state.stop_discord();
         assert!(state.discord.is_none());
     }
 }

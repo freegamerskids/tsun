@@ -108,9 +108,9 @@ pub(crate) struct Settings {
     /// Whether the Discord Rich Presence is published from the user's own Discord application.
     /// Off by default.
     pub(crate) discord_enabled: bool,
-    /// The Discord Application ID the presence is published under (17–20 digits), pasted from
-    /// <https://discord.com/developers/applications>. Discord shows "Listening to" that
-    /// application's name.
+    /// An optional override for the Discord Application ID the presence is published under
+    /// (17–20 digits). Empty — the default — means tsun's own built-in application, so the
+    /// presence works without any setup; a typed id uses that application's name and assets.
     pub(crate) discord_client_id: String,
     /// What Discord shows after "Listening to", replacing the application's own name. Empty (the
     /// default) means the application's name.

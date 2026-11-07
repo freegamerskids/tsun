@@ -77,7 +77,7 @@ Status reflects what the current source implements; *Partial* means the feature 
 | MPRIS / media keys | Supported | `org.mpris.MediaPlayer2.tsun` — play/pause/stop, next/previous, seek and volume, plus metadata, artwork, position and length; while a video is open the media keys control the video. |
 | Notifications | Supported | Freedesktop `org.freedesktop.Notifications` on track change, with cover art; off by default. |
 | Last.fm scrobbling | Supported | The user's own API key and shared secret (from last.fm/api/account/create) drive `auth.getToken` → browser authorization → `auth.getSession`; `track.updateNowPlaying` on a track's start and `track.scrobble` once a play passes the official threshold (longer than 30 s, and half the track or four minutes, whichever comes first, counting real pause/seek-aware played time). Failed submissions retry from an on-disk queue with backoff; invalid ones are dropped. Local files scrobble too when they carry a title and artist. All network runs on its own thread. |
-| Discord Rich Presence | Supported | `discord` — tsun's own IPC client for the Discord desktop app (`$XDG_RUNTIME_DIR/discord-ipc-N`, the Flatpak and Snap paths, `/tmp`), on its own thread with reconnect. The presence is published under the user's own Discord application (the Settings card takes its Application ID and an optional activity name): title, artist and album, TIDAL cover art in the activity's `assets`, an elapsed/remaining bar and a "Listen on TIDAL" button (which Discord shows to other people only); each part can be switched off. Off by default. |
+| Discord Rich Presence | Supported | `discord` — tsun's own IPC client for the Discord desktop app (`$XDG_RUNTIME_DIR/discord-ipc-N`, the Flatpak and Snap paths, `/tmp`), on its own thread with reconnect. It works out of the box under tsun's built-in Discord application (public Application ID `1280598966471491594`); the Settings card also takes an optional own Application ID (an override) and an activity name. Presence: title, artist and album, TIDAL cover art in the activity's `assets`, an elapsed/remaining bar and a "Listen on TIDAL" button (which Discord shows to other people only); each part can be switched off. Off by default. |
 | Full-screen Now Playing | Supported | Overlay with large cover art, links, a seek bar, the full transport and synced lyrics; closed with Escape or the minimize button, background tinted by the cover's average colour. |
 | Music videos (browse) | Supported | Videos tab in search, Videos carousel on artist pages, Videos tab in Collection; 16:9 thumbnails with duration and quality; favourite hearts. Data from `/search` (`VIDEOS`), `/artists/{id}/videos`, `/users/{id}/favorites/videos` and `/videos/{id}`. |
 | Video playback | Supported | `video_stream` resolves `/videos/{id}/playbackinfopostpaywall` (GET; `videoquality=HIGH`), whose manifest is a plain `application/vnd.apple.mpegurl` master playlist. H.264 High + AAC MPEG-TS variants (up to 1920x1080) have no `EXT-X-KEY`, so they play without a CDM. Decoded with libavcodec, audio through cpal and the shared volume handle, A/V synced to the audio clock; play/pause, seek, volume/mute, MPRIS and Escape/close. |
@@ -99,15 +99,17 @@ Status reflects what the current source implements; *Partial* means the feature 
 
 ## Discord Rich Presence
 
-Off by default, and it needs your own Discord application: tsun cannot ship one, because a
-presence is published under the application that owns it. Go to
-[discord.com/developers/applications](https://discord.com/developers/applications), create an
-application (name it **TIDAL** — Discord writes "Listening to " in front of the application's
-name, so that name is what your friends read), then copy its **Application ID**. In Settings'
-Discord card, paste the ID (17 to 20 digits) and turn on **Show what I'm listening to**. The
-card's status line is live: *Not running* (Discord is closed or not installed), *Connecting…*,
-*Connected as <your Discord account>* or *Error* (with Discord's own words, e.g. an invalid
-Application ID). Starting the Discord app later, or restarting it, reconnects on its own.
+Off by default, and it needs no setup beyond the switch: tsun publishes the presence under its
+own Discord application (**built-in Application ID `1280598966471491594`** — a client id is
+public, not a secret), so there is nothing to register and no key to paste. Turn on **Show what
+I'm listening to** in Settings' Discord card and the presence appears. The card's status line is
+live: *Not running* (Discord is closed or not installed), *Connecting…*, *Connected as <your
+Discord account>* or *Error* (with Discord's own words). Starting the Discord app later, or
+restarting it, reconnects on its own. The **Application ID** field is an optional override for
+people who want their own application — its name, icon or uploaded art assets (create one at
+[discord.com/developers/applications](https://discord.com/developers/applications) and paste its
+17–20 digit id); an empty field means the built-in application, and clearing a saved override
+goes back to it.
 
 While it is on, the presence shows the track title, the artist, the album, the TIDAL cover art,
 an elapsed/remaining bar that follows seeking, pausing and resuming, and a **Listen on TIDAL**

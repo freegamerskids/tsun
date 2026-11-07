@@ -100,6 +100,30 @@ impl Default for Config {
     }
 }
 
+/// tsun's own Discord application, so Rich Presence works with no setup at all. An application
+/// id is public (it is not a secret): it only says which application a presence is published
+/// under, and Discord shows that application's name after "Listening to". A user who wants their
+/// own name, assets or icon can still paste their own id as an override.
+pub(crate) const DEFAULT_CLIENT_ID: &str = "1280598966471491594";
+
+/// The application id to publish under: a non-empty typed id overrides the built-in one, and a
+/// blank or whitespace-only id means "use tsun's own application".
+pub(crate) fn effective_client_id(typed: &str) -> &str {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        DEFAULT_CLIENT_ID
+    } else {
+        typed
+    }
+}
+
+/// Whether a typed Application ID may be used: blank is fine (the built-in application), and
+/// anything non-empty has to look like Discord's own 17–20 digit application ids.
+pub(crate) fn client_id_is_usable(typed: &str) -> bool {
+    let typed = typed.trim();
+    typed.is_empty() || valid_client_id(typed)
+}
+
 /// Discord Application IDs are 17 to 20 digits.
 pub(crate) fn valid_client_id(id: &str) -> bool {
     let id = id.trim();
@@ -192,13 +216,20 @@ impl Discord {
     }
 
     /// `runtime` overrides the socket search entirely (one directory, as a test's fake Discord
-    /// needs); `min_interval` is the `SET_ACTIVITY` spacing.
+    /// needs); `min_interval` is the `SET_ACTIVITY` spacing. A blank Application ID resolves to
+    /// [`DEFAULT_CLIENT_ID`] here too, so no caller can hand Discord an empty id.
     pub(crate) fn start_with(
         config: Config,
         wake: Option<Wake>,
         runtime: Option<PathBuf>,
         min_interval: Duration,
     ) -> Discord {
+        let mut config = config;
+        config.client_id = effective_client_id(&config.client_id).to_owned();
+        // `None` means the environment's own directories — except in tests, where it is always a
+        // private directory (see `private_runtime_dir`), so nothing here can ever reach a real
+        // Discord that happens to be running on this machine.
+        let runtime = runtime.or_else(private_runtime_dir);
         let (tx, rx) = mpsc::channel();
         let status: SharedStatus = Arc::new(Mutex::new(Status::Connecting));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -288,6 +319,29 @@ impl Drop for Discord {
             let _ = thread.join();
         }
     }
+}
+
+/// Where a client started without an explicit runtime directory looks for Discord's socket.
+///
+/// In a normal build that is the environment's own directories (`XDG_RUNTIME_DIR`, `TMPDIR`,
+/// `/tmp`). In a test build it is a private, per-process path instead, so a test that enables the
+/// presence (with the built-in application) searches a directory that cannot contain anybody's
+/// Discord — a fake socket is always passed in explicitly, or hosted inside such a directory.
+#[cfg(not(test))]
+fn private_runtime_dir() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(test)]
+fn private_runtime_dir() -> Option<PathBuf> {
+    Some(test_runtime_dir())
+}
+
+/// The directory a test build's environment-driven search is confined to: a per-process path
+/// that nothing listens on. Not created, so it can never hold a socket.
+#[cfg(test)]
+pub(crate) fn test_runtime_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("tsun-discord-test-runtime-{}", std::process::id()))
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1635,6 +1689,60 @@ mod tests {
         let timestamps = &playing["args"]["activity"]["timestamps"];
         let start = timestamps["start"].as_i64().expect("a start");
         assert_eq!(timestamps["end"].as_i64(), Some(start + 100), "the position is honoured");
+    }
+
+    #[test]
+    fn a_blank_id_means_the_built_in_application() {
+        assert_eq!(DEFAULT_CLIENT_ID, "1280598966471491594");
+        assert!(valid_client_id(DEFAULT_CLIENT_ID), "the built-in id must be one Discord accepts");
+        assert_eq!(effective_client_id(""), DEFAULT_CLIENT_ID);
+        assert_eq!(effective_client_id("   "), DEFAULT_CLIENT_ID, "whitespace is blank");
+        assert_eq!(effective_client_id(" 12345678901234567 "), "12345678901234567", "trimmed override");
+        assert_eq!(effective_client_id("1280598966471491594"), "1280598966471491594");
+        // Usability: blank is fine (built-in), non-empty must look like an application id.
+        assert!(client_id_is_usable(""));
+        assert!(client_id_is_usable("   "));
+        assert!(client_id_is_usable("12345678901234567"));
+        assert!(!client_id_is_usable("1234567890123456"), "too short");
+        assert!(!client_id_is_usable("123456789012345678901"), "too long");
+        assert!(!client_id_is_usable("not-a-number"));
+    }
+
+    #[test]
+    fn a_blank_id_still_hands_discord_a_real_application_id() {
+        // The client normalises the id itself too, so no caller can publish under an empty one.
+        let fake = FakeDiscord::start("builtin", 1, "tester", false);
+        let blank = Config { client_id: String::new(), ..Config::default() };
+        let discord = Discord::start_with(blank, None, Some(fake.dir().to_path_buf()), Duration::ZERO);
+        let handshake = fake.next_handshake(Duration::from_secs(5)).expect("a handshake");
+        assert_eq!(handshake["client_id"], json!(DEFAULT_CLIENT_ID));
+        assert_eq!(wait_status(&discord, Duration::from_secs(5), Status::is_connected), Status::Connected("tester".to_owned()));
+    }
+
+    #[test]
+    fn a_typed_override_wins_over_the_built_in_application() {
+        let fake = FakeDiscord::start("override", 1, "tester", false);
+        let config = config("12345678901234567");
+        let _discord = Discord::start_with(config, None, Some(fake.dir().to_path_buf()), Duration::ZERO);
+        let handshake = fake.next_handshake(Duration::from_secs(5)).expect("a handshake");
+        assert_eq!(handshake["client_id"], json!("12345678901234567"));
+    }
+
+    #[test]
+    fn test_builds_never_search_the_real_runtime_directories() {
+        // The environment-driven search of a test build is confined to a private, empty path, so
+        // a test that enables the presence cannot find (or talk to) a real Discord: the fake
+        // servers always pass their own directory, and `Discord::start` uses this one.
+        let dir = private_runtime_dir().expect("a test build always confines the search");
+        assert_eq!(dir, test_runtime_dir());
+        assert!(dir.starts_with(std::env::temp_dir()), "{dir:?}");
+        assert!(!dir.exists(), "the confined directory must not exist, let alone hold a socket");
+        let candidates = socket_candidates(Some(&dir));
+        assert!(candidates.iter().all(|path| path.starts_with(&dir)), "{candidates:?}");
+        assert!(
+            !candidates.iter().any(|path| path.starts_with("/run/user") || path.starts_with("/tmp/discord-ipc")),
+            "nothing outside the confined directory is ever tried: {candidates:?}"
+        );
     }
 
     #[test]

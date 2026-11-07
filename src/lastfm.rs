@@ -20,7 +20,9 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +44,37 @@ const QUEUE_MAX: usize = 1000;
 const MIN_TRACK_SECS: u64 = 30;
 /// A play must reach half the track or this many seconds, whichever comes first.
 const MIN_PLAYED_SECS: f64 = 240.0;
+
+/// When a play counts as a scrobble: the track must be longer than `min_track_secs` and must
+/// have played for half its length or `max_played_secs`, whichever comes first.
+///
+/// [`Thresholds::from_env`] exists for the tests alone: a generated test file is a second long
+/// and a null output device plays it faster than real time, so the official rule could never be
+/// reached there. The app never sets those variables, so it always scrobbles by the real rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Thresholds {
+    pub(crate) min_track_secs: u64,
+    pub(crate) max_played_secs: f64,
+}
+
+impl Thresholds {
+    /// The rule Last.fm documents.
+    pub(crate) const OFFICIAL: Thresholds =
+        Thresholds { min_track_secs: MIN_TRACK_SECS, max_played_secs: MIN_PLAYED_SECS };
+
+    /// [`Thresholds::OFFICIAL`], overridable per variable for a test.
+    pub(crate) fn from_env() -> Thresholds {
+        let number = |name: &str| std::env::var(name).ok().and_then(|value| value.trim().parse::<f64>().ok());
+        Thresholds {
+            min_track_secs: number("TSUN_LASTFM_MIN_TRACK_SECS")
+                .map(|secs| secs.max(0.0) as u64)
+                .unwrap_or(MIN_TRACK_SECS),
+            max_played_secs: number("TSUN_LASTFM_MIN_PLAYED_SECS")
+                .map(|secs| secs.max(0.0))
+                .unwrap_or(MIN_PLAYED_SECS),
+        }
+    }
+}
 /// First retry delay for the offline queue, doubling up to [`MAX_BACKOFF_SECS`].
 const BASE_BACKOFF_SECS: f64 = 30.0;
 const MAX_BACKOFF_SECS: f64 = 900.0;
@@ -521,16 +554,24 @@ struct Playing {
 
 /// Counts real played time from [`MediaEvent`]s. Pure: every event carries the current time in
 /// seconds, so the thresholds are unit-tested against synthetic events and clock values.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Scrobbler {
     current: Option<Playing>,
     playing: bool,
     last_update: f64,
+    thresholds: Thresholds,
+}
+
+impl Default for Scrobbler {
+    fn default() -> Self {
+        Scrobbler { current: None, playing: false, last_update: 0.0, thresholds: Thresholds::OFFICIAL }
+    }
 }
 
 impl Scrobbler {
-    pub(crate) fn new() -> Scrobbler {
-        Scrobbler::default()
+    /// A tracker counting against `thresholds` instead of the official rule.
+    pub(crate) fn with_thresholds(thresholds: Thresholds) -> Scrobbler {
+        Scrobbler { thresholds, ..Scrobbler::default() }
     }
 
     /// Folds one event in at wall-clock `now` (unix seconds) and returns what to send.
@@ -567,7 +608,9 @@ impl Scrobbler {
     /// The play in progress, if it passed the threshold, taken out of the tracker.
     fn finalize(&mut self) -> Option<Completed> {
         let current = self.current.take()?;
-        if !identifiable(&current.track) || !qualifies(current.track.duration_secs, current.played) {
+        if !identifiable(&current.track)
+            || !qualifies_with(current.track.duration_secs, current.played, self.thresholds)
+        {
             return None;
         }
         Some(Completed { track: current.track, at: current.started_at, played_secs: current.played })
@@ -580,13 +623,16 @@ pub(crate) fn identifiable(track: &MediaTrack) -> bool {
     !track.title.trim().is_empty() && !track.artist.trim().is_empty()
 }
 
-/// The official threshold: longer than 30 s, and played for half its length or four minutes,
-/// whichever comes first. An unknown length falls back to the four-minute rule.
-pub(crate) fn qualifies(duration_secs: Option<u64>, played_secs: f64) -> bool {
+/// When a play counts as a scrobble, against an explicit rule (see [`Thresholds`]).
+pub(crate) fn qualifies_with(
+    duration_secs: Option<u64>,
+    played_secs: f64,
+    thresholds: Thresholds,
+) -> bool {
     match duration_secs {
-        Some(duration) if duration <= MIN_TRACK_SECS => false,
-        Some(duration) => played_secs >= (duration as f64 * 0.5).min(MIN_PLAYED_SECS),
-        None => played_secs >= MIN_PLAYED_SECS,
+        Some(duration) if duration <= thresholds.min_track_secs => false,
+        Some(duration) => played_secs >= (duration as f64 * 0.5).min(thresholds.max_played_secs),
+        None => played_secs >= thresholds.max_played_secs,
     }
 }
 
@@ -629,6 +675,9 @@ pub(crate) enum LastFmStatus {
 pub(crate) struct LastFm {
     cmd_tx: Sender<Command>,
     rx: Receiver<LastFmStatus>,
+    /// Whether anything would actually be sent (a session exists and a toggle is on), kept in
+    /// step with `conn` and the toggles so the media hub can ask without reading UI state.
+    enabled: Arc<AtomicBool>,
     /// The connection state shown in the card.
     pub(crate) conn: Connection,
     /// The pasted API key.
@@ -641,6 +690,26 @@ pub(crate) struct LastFm {
     /// The last status line, if any, and whether it is an error.
     pub(crate) message: Option<String>,
     pub(crate) error: bool,
+}
+
+/// The handle another thread (the media hub) uses to follow playback with Last.fm: it forwards
+/// events to the scrobble thread and answers whether anything would be sent.
+#[derive(Clone)]
+pub(crate) struct LastFmSink {
+    tx: Sender<Command>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl LastFmSink {
+    /// Forwards one playback event to the scrobble thread. Never blocks.
+    pub(crate) fn handle(&self, event: MediaEvent) {
+        let _ = self.tx.send(Command::Media(event));
+    }
+
+    /// Whether anything would actually be sent: a session exists and a toggle is on.
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
 }
 
 /// The card's view of the connection.
@@ -669,9 +738,10 @@ impl LastFm {
         // their persisted state.
         let (key, secret) = (store.api_key.clone(), store.secret.clone());
         thread::spawn(move || run(store, base, cmd_rx, status_tx, waker));
-        LastFm {
+        let lastfm = LastFm {
             cmd_tx,
             rx: status_rx,
+            enabled: Arc::new(AtomicBool::new(false)),
             conn,
             key: TextEdit::new(key),
             secret: TextEdit::new(secret),
@@ -680,17 +750,20 @@ impl LastFm {
             love: prefs.2,
             message: None,
             error: false,
-        }
+        };
+        lastfm.mark_enabled();
+        lastfm
     }
 
-    /// Forwards one playback event to the thread. Never blocks.
-    pub(crate) fn handle(&self, event: MediaEvent) {
-        let _ = self.cmd_tx.send(Command::Media(event));
+    /// The handle the media hub sends playback events through.
+    pub(crate) fn sink(&self) -> LastFmSink {
+        LastFmSink { tx: self.cmd_tx.clone(), enabled: Arc::clone(&self.enabled) }
     }
 
-    /// Whether anything would actually be sent: a session exists and a toggle is on.
-    pub(crate) fn enabled(&self) -> bool {
-        matches!(self.conn, Connection::Connected { .. }) && (self.scrobble || self.now_playing)
+    /// Recomputes [`LastFmSink::enabled`] after the connection state or a toggle changed.
+    fn mark_enabled(&self) {
+        let on = matches!(self.conn, Connection::Connected { .. }) && (self.scrobble || self.now_playing);
+        self.enabled.store(on, Ordering::Relaxed);
     }
 
     /// A client for UI tests: the same state, but no thread, no filesystem and no network.
@@ -703,9 +776,10 @@ impl LastFm {
         } else {
             Connection::Disconnected
         };
-        LastFm {
+        let lastfm = LastFm {
             cmd_tx,
             rx: status_rx,
+            enabled: Arc::new(AtomicBool::new(false)),
             conn,
             key: TextEdit::new(store.api_key.clone()),
             secret: TextEdit::new(store.secret.clone()),
@@ -714,7 +788,9 @@ impl LastFm {
             love: store.love,
             message: None,
             error: false,
-        }
+        };
+        lastfm.mark_enabled();
+        lastfm
     }
 
     /// Applies one status from the thread to the card's state. Returns whether it changed.
@@ -744,6 +820,7 @@ impl LastFm {
                 self.error = false;
             }
         }
+        self.mark_enabled();
         true
     }
 }
@@ -752,7 +829,8 @@ impl LastFm {
 fn run(store: Store, base: String, cmd_rx: Receiver<Command>, tx: Sender<LastFmStatus>, waker: Waker) {
     let api = Api::with_base(&base);
     let mut store = store;
-    let mut tracker = Scrobbler::new();
+    // The official scrobble rule, unless a test asked for another one (see `Thresholds`).
+    let mut tracker = Scrobbler::with_thresholds(Thresholds::from_env());
     let mut queue = PendingQueue::load();
     let mut pending_token: Option<String> = None;
     let mut warned_retry = false;
@@ -983,6 +1061,7 @@ impl Ui {
             LastFmPref::NowPlaying => lastfm.now_playing = !lastfm.now_playing,
             LastFmPref::Love => lastfm.love = !lastfm.love,
         }
+        lastfm.mark_enabled();
         let command = Command::SetPrefs {
             scrobble: lastfm.scrobble,
             now_playing: lastfm.now_playing,
@@ -1042,12 +1121,17 @@ pub(crate) enum LastFmPref {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// The official scrobble rule, for the threshold tests.
+    fn official(duration_secs: Option<u64>, played_secs: f64) -> bool {
+        qualifies_with(duration_secs, played_secs, Thresholds::OFFICIAL)
+    }
 
     fn track(title: &str, artist: &str, duration: Option<u64>) -> MediaTrack {
         MediaTrack {
@@ -1168,7 +1252,7 @@ mod tests {
 
     #[test]
     fn a_31_second_track_scrobbles_at_its_halfway_point() {
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("T", "A", Some(31))), 100.0);
         // 15 s in: below 50% of 31 s.
         let early = tracker.on_event(&MediaEvent::Stopped, 115.0);
@@ -1177,7 +1261,7 @@ mod tests {
 
     #[test]
     fn a_31_second_track_scrobbled_when_it_passed_half() {
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("T", "A", Some(31))), 100.0);
         let done = tracker.on_event(&MediaEvent::Finished, 116.0);
         let completed = done.scrobble.expect("past 50% of 31 s");
@@ -1188,7 +1272,7 @@ mod tests {
 
     #[test]
     fn a_29_second_track_never_scrobbles() {
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("T", "A", Some(29))), 100.0);
         let done = tracker.on_event(&MediaEvent::Finished, 200.0);
         assert!(done.scrobble.is_none());
@@ -1196,12 +1280,12 @@ mod tests {
 
     #[test]
     fn a_long_track_needs_four_minutes_even_at_ten_percent() {
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("T", "A", Some(3600))), 0.0);
         // 50% would be 30 minutes; four minutes is sooner.
         let early = tracker.on_event(&MediaEvent::Stopped, 239.0);
         assert!(early.scrobble.is_none());
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("T", "A", Some(3600))), 0.0);
         let done = tracker.on_event(&MediaEvent::Stopped, 240.0);
         assert!(done.scrobble.is_some());
@@ -1210,7 +1294,7 @@ mod tests {
     #[test]
     fn paused_time_does_not_count() {
         // A 200 s track needs 100 s of real playing.
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("T", "A", Some(200))), 0.0);
         tracker.on_event(&MediaEvent::Paused { position_secs: 10.0 }, 10.0);
         // 5 minutes paused, then 40 s more of real playing: 50 s total, below half.
@@ -1218,7 +1302,7 @@ mod tests {
         let done = tracker.on_event(&MediaEvent::Stopped, 350.0);
         assert!(done.scrobble.is_none(), "only 50 s of the 200 s track played");
         // Real playing now adds up to 110 s, past the halfway point.
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("T", "A", Some(200))), 0.0);
         tracker.on_event(&MediaEvent::Paused { position_secs: 10.0 }, 10.0);
         tracker.on_event(&MediaEvent::Resumed { position_secs: 10.0 }, 310.0);
@@ -1228,7 +1312,7 @@ mod tests {
 
     #[test]
     fn seeking_does_not_add_played_time() {
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("T", "A", Some(300))), 0.0);
         // Jump to the last 10 s after only 20 s of real listening.
         tracker.on_event(&MediaEvent::Seeked { position_secs: 290.0 }, 20.0);
@@ -1238,7 +1322,7 @@ mod tests {
 
     #[test]
     fn a_new_track_finalizes_the_previous_one() {
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("One", "A", Some(60))), 0.0);
         // 40 s of a 60 s track is past half: starting the next one scrobbles it.
         let actions = tracker.on_event(&started(track("Two", "B", Some(60))), 40.0);
@@ -1248,7 +1332,7 @@ mod tests {
 
     #[test]
     fn repeat_one_scrobbles_again() {
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         tracker.on_event(&started(track("T", "A", Some(40))), 0.0);
         let first = tracker.on_event(&MediaEvent::Finished, 40.0);
         assert!(first.scrobble.is_some());
@@ -1260,7 +1344,7 @@ mod tests {
 
     #[test]
     fn a_track_without_an_artist_is_not_scrobbled_or_announced() {
-        let mut tracker = Scrobbler::new();
+        let mut tracker = Scrobbler::default();
         let actions = tracker.on_event(&started(track("T", "", Some(60))), 0.0);
         assert!(actions.now_playing.is_none());
         let done = tracker.on_event(&MediaEvent::Finished, 120.0);
@@ -1269,9 +1353,9 @@ mod tests {
 
     #[test]
     fn an_unknown_length_uses_the_four_minute_rule() {
-        assert!(!qualifies(None, 239.0));
-        assert!(qualifies(None, 240.0));
-        assert!(!qualifies(Some(29), 1000.0));
+        assert!(!official(None, 239.0));
+        assert!(official(None, 240.0));
+        assert!(!official(Some(29), 1000.0));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1328,13 +1412,27 @@ mod tests {
     }
 
     /// A tiny server answering one scripted response per request, then closing.
-    struct Mock {
-        base: String,
+    ///
+    /// `pub(crate)` so the worker's integration test can point a real Last.fm client at it; the
+    /// requests it recorded are how a test checks what was actually sent.
+    pub(crate) struct Mock {
+        pub(crate) base: String,
         seen: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
         requests: Arc<AtomicUsize>,
     }
 
     impl Mock {
+        /// Answers `count` requests with the same successful body (a test that only cares about
+        /// which methods were called does not need to script each one).
+        pub(crate) fn repeating(count: usize, body: String) -> Mock {
+            Mock::start(vec![(200, body); count])
+        }
+
+        /// Every request's form parameters, in the order they arrived.
+        pub(crate) fn requests(&self) -> Vec<Vec<(String, String)>> {
+            self.seen.lock().unwrap().clone()
+        }
+
         fn start(responses: Vec<(u16, String)>) -> Mock {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();

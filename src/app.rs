@@ -18,7 +18,7 @@ use crate::history_log::{self, PlayEntry};
 use crate::lastfm::LastFm;
 use crate::local;
 use crate::mpris::{Mpris, MprisCommand, MprisMeta, MprisPlayback, MprisTransport};
-use crate::notify::{Notification, Notifier};
+use crate::notify::Notifier;
 use crate::playback::{self, Queue, Upcoming, UpcomingSource};
 use crate::recent;
 use crate::settings::{Settings, StartupPage};
@@ -92,14 +92,17 @@ pub(crate) enum Cmd {
     ArtistTopTracks { id: u64, offset: u32 },
     /// Resolves a video's HLS master playlist from TIDAL.
     OpenVideo { seq: u64, id: u64 },
-    Play { seq: u64, id: u64 },
+    /// Plays a TIDAL track. The [`Track`] travels with it so the worker can tell the media hub
+    /// (Discord, Last.fm, MPRIS, notifications) what started without the UI having to apply
+    /// anything — which is what keeps those integrations in step while no frame is drawn.
+    Play { seq: u64, track: Track },
     /// Plays a local file directly through the shared audio player.
     PlayLocal {
         seq: u64,
-        id: u64,
         path: PathBuf,
         quality: String,
         replaygain: Option<f32>,
+        track: Track,
     },
     SetPaused { seq: u64, paused: bool },
     Seek { seq: u64, seconds: f64 },
@@ -519,6 +522,10 @@ pub(crate) struct Ui {
     pub(crate) covers: Option<CoverArt>,
     /// Desktop notifications, when the user has them on and a session bus is reachable.
     pub(crate) notifier: Option<Notifier>,
+    /// The hub every integration that follows playback listens to. The worker reports what is
+    /// playing to it, so Discord, Last.fm, MPRIS and notifications keep up even while the window
+    /// is not being drawn; the UI configures them here and drains what it must show.
+    pub(crate) media: Arc<crate::media_hub::MediaHub>,
     /// The host's output devices as `(name, is_default)`, enumerated when the Settings page is
     /// first shown (or when its Refresh button is pressed) rather than once per frame.
     pub(crate) output_devices: Option<Vec<(String, bool)>>,
@@ -575,11 +582,14 @@ pub(crate) struct Ui {
     /// The playlist reorder currently awaiting confirmation, so a failed move can be rolled back
     /// (and a stale answer for a superseded move ignored).
     pub(crate) playlist_move: Option<(String, u64, u64)>,
-    /// The last MPRIS metadata key `(track id, cover)`, so a signal goes out only on a change.
+    /// The last MPRIS metadata key `(track id, cover)` the *video* published, so a signal goes
+    /// out only on a change. Music's metadata is the hub's.
     pub(crate) mpris_track: Option<(u64, Option<String>)>,
-    /// The last volume pushed to MPRIS, so `set_volume` only signals on a change.
+    /// The last volume the video published, so `set_volume` only signals on a change.
     pub(crate) mpris_volume: Option<f64>,
-    pub(crate) mpris: Option<Mpris>,
+    /// The MPRIS service, shared with the media hub: the hub publishes what is playing, and the
+    /// UI publishes a video's own state while the video view owns the transport.
+    pub(crate) mpris: Option<Arc<Mpris>>,
     pub(crate) mpris_rx: Option<Receiver<MprisCommand>>,
     /// Last.fm scrobbling, when the thread could be started. The card reads its state; playback
     /// events reach it through [`Ui::emit_media`].
@@ -679,15 +689,9 @@ fn set_id(set: &mut HashSet<u64>, id: &str, on: bool) {
     }
 }
 
-/// The second line of a track-change notification: `"artist — album"`, or whichever half is
-/// known. Empty when neither is.
-fn notification_body(playing: &NowPlaying) -> String {
-    match (playing.artist.is_empty(), playing.album.is_empty()) {
-        (false, false) => format!("{} — {}", playing.artist, playing.album),
-        (false, true) => playing.artist.clone(),
-        (true, false) => playing.album.clone(),
-        (true, true) => String::new(),
-    }
+/// The volume MPRIS reports: the user's volume, or zero while muted.
+fn gain_of(settings: &Settings) -> f64 {
+    if settings.muted { 0.0 } else { settings.volume as f64 }
 }
 
 /// Builds the initial state, remembering the event-loop handle so the tray can reach it.
@@ -790,6 +794,7 @@ pub(crate) fn init() -> Ui {
         poll_trace: None,
         covers: None,
         notifier: None,
+        media: crate::media_hub::MediaHub::new(),
         output_devices: None,
         settings_section: std::cell::Cell::new(crate::ui::settings::SettingsSection::General),
         settings_nav_wide: std::cell::Cell::new(false),
@@ -876,6 +881,11 @@ pub(crate) fn setup(s: &mut Ui, waker: Waker) {
     let Some(cmd_rx) = s.cmd_rx.take() else { return };
     let Some(ev_tx) = s.ev_tx.take() else { return };
     s.artwork = Some(art::Artwork::new(waker.clone()));
+    // Everything that follows playback is driven from the media hub, whose relay thread the
+    // worker feeds: Discord, Last.fm, MPRIS and notifications then keep up even while the
+    // window is not being drawn at all. The UI configures them below and drains what it must
+    // show (`poll_media`).
+    s.media.start(waker.clone());
     // MPRIS: the desktop's commands arrive on a channel drained in `poll`. A relay thread
     // wakes the UI when one lands, exactly as the worker does, so a media key acts on the
     // next frame even while the app is idle. If the session bus is unavailable we simply run
@@ -905,14 +915,18 @@ pub(crate) fn setup(s: &mut Ui, waker: Waker) {
             wake.as_ref()();
         }
     });
-    s.mpris = Mpris::start(mpris_tx.clone()).ok();
+    s.mpris = Mpris::start(mpris_tx.clone()).ok().map(Arc::new);
     if let Some(mpris) = &s.mpris {
         mpris.set_transport_sink(transport_tx.clone());
+        let shared: Arc<Mpris> = Arc::clone(mpris);
+        let sink: Arc<dyn crate::media_hub::MprisSink> = shared;
+        s.media.set_mpris(Some(sink));
     }
     s.mpris_rx = Some(forward_rx);
     s.covers = Some(CoverArt::new(waker.clone()));
     // Last.fm scrobbling on its own thread, so its network work never touches a frame.
     s.lastfm = Some(LastFm::start(waker.clone()));
+    s.media.set_lastfm(s.lastfm.as_ref().map(LastFm::sink));
     // Local files: show the cached index at once and refresh it in the background.
     s.waker = Some(waker.clone());
     s.load_local_library();
@@ -922,13 +936,16 @@ pub(crate) fn setup(s: &mut Ui, waker: Waker) {
     // Desktop notifications are opt-in; a missing session bus just leaves them off.
     if s.settings.notifications {
         s.notifier = Notifier::start().ok();
+        s.media.set_notifier(s.notifier.clone());
     }
+    s.media.set_volume(gain_of(&s.settings));
     // Off by default: when set, the worker reports on stderr whenever frames stop being drawn
     // while a track is playing (a compositor withholding frame callbacks), which is the one
     // failure that used to stall every queue decision with them.
     s.poll_trace = PollTrace::from_env();
     let trace = s.poll_trace.clone();
-    thread::spawn(move || worker(cmd_rx, ev_tx, waker, trace));
+    let media = Arc::clone(&s.media);
+    thread::spawn(move || worker(cmd_rx, ev_tx, waker, trace, media));
     // `tsun song.flac` starts that file as a one-off queue, beside the configured library.
     let files = local::cli_audio_files();
     if !files.is_empty() {
@@ -1068,9 +1085,14 @@ pub(crate) fn poll(s: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
     changed |= drain_mpris(s, tx);
     // Last.fm's scrobble thread reports connection and scrobble status back here.
     changed |= s.poll_lastfm();
+    // What the integrations want the user to see (a track Last.fm cannot scrobble), raised
+    // while the window may have been frozen.
+    changed |= s.poll_media();
     // The Discord Rich Presence follows the settings and the field, and a status change (Discord
-    // starting or stopping) repaints the card.
+    // starting or stopping) repaints the card. The hub gets the client's event sink every frame,
+    // so a client this loop starts, replaces or drops is the one playback events reach.
     s.sync_discord();
+    s.media.set_discord(s.discord.as_ref().map(crate::discord::Discord::sink));
     if let Some(discord) = &s.discord {
         let status = discord.status();
         if s.discord_status.as_ref() != Some(&status) {
@@ -1329,9 +1351,6 @@ impl Ui {
                     self.open_launch_page();
                 } else {
                     self.login = Login::LoggedOut;
-                    if self.now_playing.is_some() || self.pending_play.is_some() {
-                        self.media_stopped();
-                    }
                     self.profile = None;
                     self.profile_menu_open = false;
                     self.menu = None;
@@ -1852,8 +1871,6 @@ impl Ui {
                             playing.output = output;
                             self.now_playing = Some(playing);
                             self.load_lyrics(id);
-                            self.notify_now_playing();
-                            self.media_started(0.0);
                         }
                     }
                 }
@@ -1865,8 +1882,6 @@ impl Ui {
                         self.notice = Some(Notice::error(format!("Playback failed: {error}")));
                     } else {
                         self.paused = paused;
-                        let position = self.current_elapsed() as f64;
-                        self.media_pause_changed(paused, position);
                     }
                 }
             }
@@ -1882,7 +1897,6 @@ impl Ui {
                 if seq == self.play_seq && !self.stopping {
                     let elapsed = self.current_elapsed();
                     self.record_play_if_listened(elapsed, true);
-                    self.media_finished();
                     self.advance_queue();
                 }
             }
@@ -1893,7 +1907,6 @@ impl Ui {
                     // follow to the new one without re-issuing anything to the worker.
                     let elapsed = self.current_elapsed();
                     self.record_play_if_listened(elapsed, true);
-                    self.media_finished();
                     self.adopt_advanced(track, quality, output);
                 }
             }
@@ -1906,15 +1919,11 @@ impl Ui {
                 if seq == self.play_seq {
                     self.pending_play = None;
                     self.stopping = false;
-                    // The track that was playing has stopped being replaced; close its play out
-                    // so its real listening time is what counts.
-                    self.media_stopped();
                     self.notice = Some(Notice::error(format!("Playback failed: {error}")));
                 }
             }
             Ev::PlaybackEnded { seq, error } => {
                 if seq == self.play_seq {
-                    self.media_stopped();
                     self.now_playing = None;
                     self.pending_play = None;
                     self.paused = false;
@@ -1928,7 +1937,6 @@ impl Ui {
                 }
             }
             Ev::Stopped => {
-                self.media_stopped();
                 self.pending_play = None;
                 self.now_playing = None;
                 self.paused = false;
@@ -2794,6 +2802,8 @@ impl Ui {
             self.pending_play = None;
             return;
         }
+        // The worker announces what started from this copy of the track.
+        let started = track.clone();
         self.selected = Some(id);
         self.play_seq += 1;
         self.paused = false;
@@ -2811,12 +2821,12 @@ impl Ui {
         let sent = match self.local_track(id) {
             Some(local_track) => self.cmd_tx.send(Cmd::PlayLocal {
                 seq: self.play_seq,
-                id,
                 path: local_track.path.clone(),
                 quality: local_track.quality_label(),
                 replaygain: local_track.replaygain,
+                track: started,
             }),
-            None => self.cmd_tx.send(Cmd::Play { seq: self.play_seq, id }),
+            None => self.cmd_tx.send(Cmd::Play { seq: self.play_seq, track: started }),
         };
         if sent.is_err() {
             self.pending_play = None;
@@ -2860,8 +2870,6 @@ impl Ui {
             output,
         });
         self.load_lyrics(id);
-        self.notify_now_playing();
-        self.media_started(0.0);
         // The worker has walked one entry off its window; hand it the fresh tail so it keeps
         // having somewhere to go.
         self.send_upcoming();
@@ -2871,6 +2879,8 @@ impl Ui {
     /// would play them, so auto-advance (and the gapless preload behind it) never needs a UI
     /// frame. Sent whenever the order can change — a track starts, the queue is edited, shuffle
     /// or repeat is toggled — and cheap enough to call on every one of those.
+    ///
+    /// It also keeps MPRIS's "can go next/previous" in step, which is the same question.
     fn send_upcoming(&self) {
         let tracks: HashMap<u64, &Track> =
             self.queue.tracks().iter().map(|track| (track.id, track)).collect();
@@ -2889,21 +2899,11 @@ impl Ui {
                 Some(Upcoming { track, source })
             })
             .collect();
+        self.media.set_can_go(self.queue.has_next(), self.queue.current().is_some());
         let _ = self.cmd_tx.send(Cmd::SetUpcoming {
             after: self.queue.current_id(),
             tracks: entries,
             cyclic: self.queue.repeat() != playback::Repeat::Off,
-        });
-    }
-
-    /// Posts a desktop notification for the track that just started, when the user has them on.
-    fn notify_now_playing(&self) {
-        let Some(notifier) = &self.notifier else { return };
-        let Some(playing) = &self.now_playing else { return };
-        notifier.notify(Notification {
-            title: playing.title.clone(),
-            body: notification_body(playing),
-            cover: playing.cover.clone(),
         });
     }
 
@@ -3087,7 +3087,7 @@ impl Ui {
         self.settings.volume = volume;
         let _ = self.cmd_tx.send(Cmd::SetVolume(volume));
         self.settings.save();
-        self.publish_mpris();
+        self.media.set_volume(gain_of(&self.settings));
     }
 
     /// Steps the volume by `delta` (keyboard and wheel).
@@ -3160,7 +3160,7 @@ impl Ui {
         self.settings.muted = muted;
         let _ = self.cmd_tx.send(Cmd::SetMuted(muted));
         self.settings.save();
-        self.publish_mpris();
+        self.media.set_volume(gain_of(&self.settings));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -3254,6 +3254,8 @@ impl Ui {
             self.notifier = None;
             self.settings.notifications = false;
         }
+        // The hub posts the notifications, so it gets (or loses) the handle with the switch.
+        self.media.set_notifier(self.notifier.clone());
         self.settings.save();
     }
 
@@ -3285,16 +3287,12 @@ impl Ui {
         };
         playing.elapsed = seconds as u64;
         self.scrub = None;
-        let position_us = (seconds * 1_000_000.0) as i64;
-        if let Some(mpris) = &self.mpris {
-            mpris.set_position(position_us);
-            mpris.emit_seeked(position_us);
-        }
+        // The worker reports the seek on to the media hub (MPRIS gets its position and a
+        // `Seeked` signal, Discord moves its bar) once it has repositioned the audio.
         let seq = self.play_seq;
         if self.cmd_tx.send(Cmd::Seek { seq, seconds }).is_err() {
             self.notice = Some(Notice::error("The TIDAL worker is not running."));
         }
-        self.media_seeked(seconds);
     }
 
     /// Seeks to a fraction of the current track (a click or drag on the progress bar).
@@ -3442,75 +3440,41 @@ impl Ui {
         }
     }
 
-    /// Pushes the current playback state to MPRIS, if the service is running.
+    /// Pushes the *video* player's state to MPRIS, if the service is running.
+    ///
+    /// Music's metadata, status, position and volume belong to the media hub, which the worker
+    /// feeds (so they keep up while no frame is drawn); the video view owns the transport while
+    /// it is up, and its state lives here, so the UI publishes it — and tells the hub to leave
+    /// MPRIS alone in the meantime (see [`MediaHub::set_video`](crate::media_hub::MediaHub::set_video)).
     fn publish_mpris(&mut self) {
-        if self.mpris.is_none() {
-            return;
-        }
+        let Some(session) = self.video.as_ref() else { return };
+        let Some(mpris) = self.mpris.as_ref() else { return };
         let volume = if self.settings.muted { 0.0 } else { self.settings.volume } as f64;
-        if let Some(session) = self.video.as_ref() {
-            let video = &session.video;
-            let key = (video.id, Some("video".to_owned()));
-            let metadata = MprisMeta {
-                title: video.title.clone(),
-                artist: video.artist.clone(),
-                album: String::new(),
-                art_url: video.image.as_deref().and_then(art::video_art_url),
-                length_us: session.engine.duration_secs() * 1_000_000,
-                track_id: format!("video-{}", video.id),
-            };
-            let status = match session.engine.status() {
-                video::Status::Paused => MprisPlayback::Paused,
-                video::Status::Ended | video::Status::Failed(_) => MprisPlayback::Stopped,
-                _ => MprisPlayback::Playing,
-            };
-            let position_us = (session.engine.position_secs() * 1_000_000.0) as i64;
-            let track_changed = Some(key.clone()) != self.mpris_track;
-            let volume_changed = self.mpris_volume != Some(volume);
-            self.mpris_track = Some(key);
-            self.mpris_volume = Some(volume);
-            let Some(mpris) = &self.mpris else { return };
-            if track_changed {
-                mpris.set_metadata(metadata);
-            }
-            mpris.set_playback(status);
-            mpris.set_can_go(false, false);
-            if volume_changed {
-                mpris.set_volume(volume);
-            }
-            mpris.set_position(position_us);
-            return;
-        }
-        let playing = self.now_playing.as_ref().or(self.pending_play.as_ref());
-        let key = playing.map(|track| (track.id, track.cover.clone()));
-        let metadata = playing.map(|track| MprisMeta {
-            title: track.title.clone(),
-            artist: track.artist.clone(),
-            album: track.album.clone(),
-            art_url: track.cover.as_deref().and_then(|cover| art::art_url(cover, 320)),
-            length_us: track.duration.unwrap_or(0) * 1_000_000,
-            track_id: track.id.to_string(),
-        });
-        let status = if self.now_playing.is_some() && !self.paused {
-            MprisPlayback::Playing
-        } else if self.now_playing.is_some() {
-            MprisPlayback::Paused
-        } else {
-            MprisPlayback::Stopped
+        let video = &session.video;
+        let key = (video.id, Some("video".to_owned()));
+        let metadata = MprisMeta {
+            title: video.title.clone(),
+            artist: video.artist.clone(),
+            album: String::new(),
+            art_url: video.image.as_deref().and_then(art::video_art_url),
+            length_us: session.engine.duration_secs() * 1_000_000,
+            track_id: format!("video-{}", video.id),
         };
-        let position_us = (self.current_elapsed() * 1_000_000) as i64;
-        let can_next = self.queue.has_next();
-        let can_previous = self.queue.current().is_some();
-        let track_changed = key != self.mpris_track;
+        let status = match session.engine.status() {
+            video::Status::Paused => MprisPlayback::Paused,
+            video::Status::Ended | video::Status::Failed(_) => MprisPlayback::Stopped,
+            _ => MprisPlayback::Playing,
+        };
+        let position_us = (session.engine.position_secs() * 1_000_000.0) as i64;
+        let track_changed = Some(key.clone()) != self.mpris_track;
         let volume_changed = self.mpris_volume != Some(volume);
-        self.mpris_track = key;
+        self.mpris_track = Some(key);
         self.mpris_volume = Some(volume);
-        let Some(mpris) = &self.mpris else { return };
         if track_changed {
-            mpris.set_metadata(metadata.unwrap_or_default());
+            mpris.set_metadata(metadata);
         }
         mpris.set_playback(status);
-        mpris.set_can_go(can_next, can_previous);
+        mpris.set_can_go(false, false);
         if volume_changed {
             mpris.set_volume(volume);
         }
@@ -3549,9 +3513,11 @@ impl Ui {
         }
         if self.now_playing.is_some() || self.pending_play.is_some() || !self.queue.is_empty() {
             // The music player and a video must never share the output. The worker drops its
-            // upcoming order with the stop, so no music auto-advances behind the video.
+            // upcoming order with the stop, so no music auto-advances behind the video — and the
+            // hub stops publishing music to MPRIS, which the video view owns from here on.
             let _ = self.cmd_tx.send(Cmd::Stop);
         }
+        self.media.set_video(true);
         self.now_playing = None;
         self.pending_play = None;
         self.paused = false;
@@ -3578,7 +3544,12 @@ impl Ui {
         self.video_seq += 1;
         self.video_clock = None;
         if self.mpris.is_some() {
-            self.publish_mpris();
+            // The hub takes MPRIS back: nothing is playing, and the video's metadata key no
+            // longer describes what the service shows.
+            self.mpris_track = None;
+            self.mpris_volume = None;
+            self.media.set_video(false);
+            self.media.set_can_go(self.queue.has_next(), self.queue.current().is_some());
         }
     }
 

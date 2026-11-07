@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::app::{Notice, NowPlaying, Ui};
+use crate::media_hub::MediaNote;
 
 /// One playable item, in the form the integrations need it. `id` is a stable identity: TIDAL's
 /// numeric track id as text, or a local file's path hash. `cover_url` is an https TIDAL image
@@ -56,64 +57,53 @@ impl MediaTrack {
             local: crate::local::is_local_id(playing.id),
         }
     }
+
+    /// The same, from the queue track the worker starts (the metadata the hub publishes never
+    /// depends on the UI having applied anything).
+    pub(crate) fn from_track(track: &crate::tidal::Track) -> Self {
+        MediaTrack {
+            id: track.id.to_string(),
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            duration_secs: track.duration,
+            cover_url: track.cover.clone(),
+            local: crate::local::is_local_id(track.id),
+        }
+    }
 }
 
 impl Ui {
-    /// Fans one playback event out to every integration that is running. Cheap and
-    /// non-blocking: each integration forwards it to its own thread.
+    /// The UI's side of the media fan-out, for a test that drives the hub itself: the app's own
+    /// events come from the worker (see [`crate::worker`]), which is what makes them independent
+    /// of the window being drawn.
+    ///
+    /// It installs the same sinks `setup` does and drains the notes `poll` would, so a test can
+    /// check what an integration would see.
+    #[cfg(test)]
     pub(crate) fn emit_media(&mut self, event: MediaEvent) {
-        // A track Last.fm cannot identify (a local file with no artist tag) is skipped, and the
-        // user is told why instead of silently losing the scrobble.
-        let unlabelled = match (&self.lastfm, &event) {
-            (Some(lastfm), MediaEvent::Started { track, .. })
-                if lastfm.enabled() && track.artist.trim().is_empty() =>
-            {
-                Some(track.title.clone())
+        self.media.set_lastfm(self.lastfm.as_ref().map(crate::lastfm::LastFm::sink));
+        self.media.set_discord(self.discord.as_ref().map(crate::discord::Discord::sink));
+        self.media.dispatch_now(event);
+        self.poll_media();
+    }
+
+    /// Applies anything the integrations want the user to see. Called from `poll`, so a note
+    /// raised while no frame was running is shown as soon as the window is drawn again.
+    pub(crate) fn poll_media(&mut self) -> bool {
+        let mut changed = false;
+        for note in self.media.take_notes() {
+            match note {
+                MediaNote::NoArtistTag { title } => {
+                    // A track Last.fm cannot identify is skipped, and the user is told why
+                    // instead of silently losing the scrobble.
+                    self.notice = Some(Notice::info(format!(
+                        "Not scrobbling “{title}”: it has no artist tag"
+                    )));
+                    changed = true;
+                }
             }
-            _ => None,
-        };
-        if let Some(title) = unlabelled {
-            self.notice = Some(Notice::info(format!(
-                "Not scrobbling “{title}”: it has no artist tag"
-            )));
         }
-        if let Some(lastfm) = &self.lastfm {
-            lastfm.handle(event.clone());
-        }
-        // Discord: the presence follows the same events, on its own thread.
-        if let Some(discord) = &self.discord {
-            discord.media_event(&event);
-        }
-    }
-
-    /// Emits [`MediaEvent::Started`] for the track that just began playing.
-    pub(crate) fn media_started(&mut self, position_secs: f64) {
-        let Some(playing) = self.now_playing.as_ref() else { return };
-        let track = MediaTrack::from_now_playing(playing);
-        self.emit_media(MediaEvent::Started { track, position_secs });
-    }
-
-    /// Emits `Paused`/`Resumed` for a transport state change.
-    pub(crate) fn media_pause_changed(&mut self, paused: bool, position_secs: f64) {
-        if paused {
-            self.emit_media(MediaEvent::Paused { position_secs });
-        } else {
-            self.emit_media(MediaEvent::Resumed { position_secs });
-        }
-    }
-
-    /// Emits [`MediaEvent::Seeked`] at `position_secs`.
-    pub(crate) fn media_seeked(&mut self, position_secs: f64) {
-        self.emit_media(MediaEvent::Seeked { position_secs });
-    }
-
-    /// Emits [`MediaEvent::Stopped`].
-    pub(crate) fn media_stopped(&mut self) {
-        self.emit_media(MediaEvent::Stopped);
-    }
-
-    /// Emits [`MediaEvent::Finished`] (the track reached its natural end).
-    pub(crate) fn media_finished(&mut self) {
-        self.emit_media(MediaEvent::Finished);
+        changed
     }
 }

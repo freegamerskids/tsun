@@ -17,6 +17,8 @@ use rune::Waker;
 use crate::app::{Cmd, Ev};
 use crate::audio::{Outcome, OutputOptions, Player, Source, Volume};
 use crate::local;
+use crate::media_events::MediaEvent;
+use crate::media_hub::MediaHub;
 use crate::mpris::MprisTransport;
 use crate::playback::{Upcoming, UpcomingQueue, UpcomingSource};
 use crate::tidal::{Client, Track, VideoStream};
@@ -262,6 +264,9 @@ struct Worker {
     ev_tx: Sender<Ev>,
     waker: Waker,
     trace: Option<Arc<PollTrace>>,
+    /// Where every integration that follows playback is told what is happening. Sending is a
+    /// channel push, so none of this ever blocks the thread that owns the audio.
+    media: Arc<MediaHub>,
     /// Whether the current frame-less stretch has already been reported.
     stalled_reported: bool,
 }
@@ -272,6 +277,7 @@ pub(crate) fn worker(
     ev_tx: Sender<Ev>,
     waker: Waker,
     trace: Option<Arc<PollTrace>>,
+    media: Arc<MediaHub>,
 ) {
     let mut worker = Worker {
         backend: Backend::new(Volume::new()),
@@ -285,6 +291,7 @@ pub(crate) fn worker(
         ev_tx,
         waker,
         trace,
+        media,
         stalled_reported: false,
     };
     let logged_in = match Client::new() {
@@ -306,6 +313,30 @@ impl Worker {
     fn emit(&self, ev: Ev) {
         let _ = self.ev_tx.send(ev);
         self.waker.as_ref()();
+    }
+
+    /// Tells every integration that follows playback that `track` started, so Discord, Last.fm,
+    /// MPRIS and notifications move on even if the window is never drawn again.
+    fn announce(&self, track: &Track) {
+        self.media.media(MediaEvent::Started {
+            track: crate::media_events::MediaTrack::from_track(track),
+            position_secs: 0.0,
+        });
+    }
+
+    /// Reports `paused` (with where the playhead is) or a stop, the two things playback reports
+    /// besides a track starting.
+    fn announce_paused(&self, paused: bool, position_secs: f64) {
+        let event = if paused {
+            MediaEvent::Paused { position_secs }
+        } else {
+            MediaEvent::Resumed { position_secs }
+        };
+        self.media.media(event);
+    }
+
+    fn announce_stopped(&self) {
+        self.media.media(MediaEvent::Stopped);
     }
 
     /// Hands the worker's upcoming order to the audio layer: opens the track after the current
@@ -347,6 +378,8 @@ impl Worker {
             let Some(entry) = self.next_entry() else {
                 self.current_id = None;
                 self.paused = false;
+                // Nothing left to play: the end of the queue, exactly as the UI would report it.
+                self.media.media(MediaEvent::Finished);
                 emit(Ev::TrackFinished { seq });
                 return;
             };
@@ -357,6 +390,7 @@ impl Worker {
                     self.paused = false;
                     self.last_position = None;
                     self.preloaded = None;
+                    self.announce(&entry.track);
                     emit(Ev::AutoAdvanced {
                         seq,
                         track: entry.track,
@@ -369,6 +403,9 @@ impl Worker {
                 Err(error) => {
                     failures += 1;
                     last_error = Some(error.clone());
+                    // The track that should have played never started: report that playback
+                    // stopped, as the UI used to when a `PlayFailed` came through.
+                    self.announce_stopped();
                     emit(Ev::PlayFailed { seq, error });
                 }
             }
@@ -378,6 +415,7 @@ impl Worker {
         self.paused = false;
         self.last_position = None;
         self.preloaded = None;
+        self.announce_stopped();
         emit(Ev::PlaybackEnded { seq, error: last_error });
     }
 
@@ -408,6 +446,7 @@ impl Worker {
         self.paused = false;
         self.last_position = None;
         self.upcoming.consume(id);
+        self.announce(&track);
         emit(Ev::AutoAdvanced { seq, track, quality: None, output });
         self.arm_preload();
     }
@@ -454,16 +493,23 @@ impl Worker {
                         self.last_position = None;
                         match result {
                             Ok(Outcome::Finished) => self.advance(seq, &emit),
-                            Ok(Outcome::Stopped) => emit(Ev::Stopped),
+                            Ok(Outcome::Stopped) => {
+                                self.announce_stopped();
+                                emit(Ev::Stopped);
+                            }
                             Err(error) => {
                                 self.current_id = None;
                                 self.paused = false;
+                                self.announce_stopped();
                                 emit(Ev::PlaybackEnded { seq, error: Some(error) });
                             }
                         }
                         continue;
                     }
                     if let Some(elapsed) = self.backend.position_seconds() {
+                        // MPRIS reports the position on demand, so it needs the playhead even
+                        // when nothing else changes.
+                        self.media.position(elapsed as f64);
                         if self.last_position != Some(elapsed) {
                             self.last_position = Some(elapsed);
                             emit(Ev::PlaybackProgress { seq, elapsed });
@@ -749,7 +795,7 @@ impl Worker {
                     let result = self.backend.video_stream(id);
                     emit(Ev::VideoReady { seq, id, result, volume });
                 }
-                Cmd::PlayLocal { seq, id, path, quality, replaygain } => {
+                Cmd::PlayLocal { seq, path, quality, replaygain, track } => {
                     // A local play supersedes anything either player was doing, and its tail
                     // comes from the UI (see `Cmd::SetUpcoming`).
                     self.playing_seq = None;
@@ -760,18 +806,23 @@ impl Worker {
                     match self.backend.play_file(path, replaygain, quality) {
                         Ok((quality, output)) => {
                             self.playing_seq = Some(seq);
-                            self.current_id = Some(id);
+                            self.current_id = Some(track.id);
                             self.last_position = None;
-                            emit(Ev::Playing { seq, id, quality, output });
+                            self.announce(&track);
+                            emit(Ev::Playing { seq, id: track.id, quality, output });
                         }
-                        Err(error) => emit(Ev::PlayFailed { seq, error }),
+                        Err(error) => {
+                            self.announce_stopped();
+                            emit(Ev::PlayFailed { seq, error });
+                        }
                     }
                     self.arm_preload();
                 }
-                Cmd::Play { seq, id } => {
+                Cmd::Play { seq, track } => {
                     // A local id is never a TIDAL track id; it must never reach the TIDAL play
                     // endpoint (the UI routes local files through `PlayLocal` instead).
-                    if local::is_local_id(id) {
+                    if local::is_local_id(track.id) {
+                        self.announce_stopped();
                         emit(Ev::PlayFailed {
                             seq,
                             error: "This is a local file, not a TIDAL track.".to_owned(),
@@ -783,14 +834,18 @@ impl Worker {
                     self.current_id = None;
                     self.paused = false;
                     self.preloaded = None;
-                    match self.backend.play_tidal(id) {
+                    match self.backend.play_tidal(track.id) {
                         Ok((quality, output)) => {
                             self.playing_seq = Some(seq);
-                            self.current_id = Some(id);
+                            self.current_id = Some(track.id);
                             self.last_position = None;
-                            emit(Ev::Playing { seq, id, quality, output });
+                            self.announce(&track);
+                            emit(Ev::Playing { seq, id: track.id, quality, output });
                         }
-                        Err(error) => emit(Ev::PlayFailed { seq, error }),
+                        Err(error) => {
+                            self.announce_stopped();
+                            emit(Ev::PlayFailed { seq, error });
+                        }
                     }
                     self.arm_preload();
                 }
@@ -802,6 +857,7 @@ impl Worker {
                     };
                     if result.is_ok() {
                         self.paused = paused;
+                        self.announce_paused(paused, self.backend.position_seconds().unwrap_or(0) as f64);
                     }
                     emit(Ev::PauseChanged { seq, paused, error: result.err() });
                 }
@@ -812,6 +868,7 @@ impl Worker {
                         } else if let Some(client) = self.backend.client.as_ref() {
                             client.seek(seconds);
                         }
+                        self.media.media(MediaEvent::Seeked { position_secs: seconds });
                     }
                 }
                 Cmd::Transport(command) => {
@@ -833,6 +890,7 @@ impl Worker {
                     let result = self.backend.set_paused(paused);
                     if result.is_ok() {
                         self.paused = paused;
+                        self.announce_paused(paused, self.backend.position_seconds().unwrap_or(0) as f64);
                     }
                     emit(Ev::PauseChanged { seq, paused, error: result.err() });
                 }
@@ -887,6 +945,7 @@ impl Worker {
                     self.cyclic = false;
                     self.upcoming.clear();
                     self.backend.stop_all();
+                    self.announce_stopped();
                     emit(Ev::Stopped);
                 }
                 Cmd::Logout => {
@@ -901,6 +960,7 @@ impl Worker {
                     if let Some(client) = self.backend.client.as_mut() {
                         client.logout();
                     }
+                    self.announce_stopped();
                     emit(Ev::Ready { logged_in: false });
                 }
             }
@@ -915,6 +975,7 @@ mod tests {
     use crate::tidal::Track;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
+    use std::sync::Mutex;
 
     // ---- the poll-stall diagnostic ---------------------------------------------------------
 
@@ -1018,6 +1079,11 @@ mod tests {
             unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
             ConfigHome { previous, dir, _turn: turn }
         }
+
+        /// Writes a file into the scratch config directory (a session, a Last.fm store, …).
+        fn write_file(&self, name: &str, contents: &str) {
+            std::fs::write(self.dir.join("tsun").join(name), contents).unwrap();
+        }
     }
 
     impl Drop for ConfigHome {
@@ -1067,24 +1133,25 @@ mod tests {
         for path in [&a_path, &b_path, &c_path] {
             write_wav(path, 1);
         }
-        let a = track(local::local_id(&a_path), "A");
-        let b = track(local::local_id(&b_path), "B");
+        let a = track(local::local_id(&a_path), "Aa");
+        let b = track(local::local_id(&b_path), "Bb");
         let c = track(local::local_id(&c_path), "C");
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
         let waker: Waker = Arc::new(|| {});
-        let handle = std::thread::spawn(move || worker(cmd_rx, ev_tx, waker, None));
+        let media = crate::media_hub::MediaHub::new();
+        let handle = std::thread::spawn(move || worker(cmd_rx, ev_tx, waker, None, media));
         // Silence is a second guard beside the null device.
         cmd_tx.send(Cmd::SetVolume(0.0)).unwrap();
         cmd_tx.send(Cmd::SetMuted(true)).unwrap();
         cmd_tx
             .send(Cmd::PlayLocal {
                 seq: 1,
-                id: a.id,
                 path: a_path.clone(),
                 quality: "WAV 16-bit/44.1 kHz".to_owned(),
                 replaygain: None,
+                track: a.clone(),
             })
             .unwrap();
         cmd_tx
@@ -1171,6 +1238,238 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The integrations that follow playback keep up with **no UI at all**: the worker's events
+    /// reach Discord (a fake IPC server), Last.fm (a mock API) and MPRIS (a recording sink)
+    /// while nobody drains the UI's events or runs a frame, and each one sees the auto-advance.
+    ///
+    /// Same opt-in as the test above (null ALSA device, `TSUN_AUDIO_TEST=1`). The Last.fm
+    /// thresholds are turned down for it: a generated file is a second long and the null device
+    /// plays it faster than real time, so the official rule could never be reached.
+    #[test]
+    fn the_integrations_follow_a_worker_auto_advance_with_no_ui() {
+        if std::env::var_os("TSUN_AUDIO_TEST").is_none() {
+            eprintln!("skipping the worker integration test (set TSUN_AUDIO_TEST=1 with a null ALSA device)");
+            return;
+        }
+        use crate::discord::{Config as DiscordConfig, Discord};
+        use crate::lastfm::{LastFm, tests::Mock as LastFmMock};
+        use crate::media_hub::MediaHub;
+
+        let config_home = ConfigHome::new("integrations");
+        // An authorized Last.fm session with both switches on, so the worker's events scrobble.
+        config_home.write_file(
+            "lastfm.json",
+            r#"{"api_key":"key","secret":"sec","session_key":"SESS","username":"tester","scrobble":true,"now_playing":true,"love":false}"#,
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "tsun-worker-integrations-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.wav");
+        let b_path = dir.join("b.wav");
+        for path in [&a_path, &b_path] {
+            write_wav(path, 1);
+        }
+        let a = track(local::local_id(&a_path), "Aa");
+        let b = track(local::local_id(&b_path), "Bb");
+
+        // The mock Last.fm: every request answers like a successful scrobble, which both
+        // `track.updateNowPlaying` and `track.scrobble` accept.
+        let mock = LastFmMock::repeating(
+            8,
+            r#"{"scrobbles":{"@attr":{"accepted":1,"ignored":0}}}"#.to_owned(),
+        );
+        // SAFETY: both variables are read by the Last.fm thread this test starts, and nothing
+        // else in the process reads them.
+        unsafe {
+            std::env::set_var("TSUN_LASTFM_API_BASE", mock.base.clone());
+            std::env::set_var("TSUN_LASTFM_MIN_TRACK_SECS", "0");
+            std::env::set_var("TSUN_LASTFM_MIN_PLAYED_SECS", "0");
+        }
+
+        let waker: Waker = Arc::new(|| {});
+        let hub = MediaHub::new();
+        hub.start(Arc::clone(&waker));
+        let mpris = Arc::new(RecordingMpris::default());
+        hub.set_mpris(Some(mpris.clone()));
+        // A real Discord client pointed at a fake socket in a temporary directory: nothing here
+        // can reach a Discord that happens to be running on this machine.
+        let fake = crate::discord::tests::FakeDiscord::start("hub", 1, "tester", false);
+        let discord = Discord::start_with(
+            DiscordConfig { client_id: "12345678901234567".to_owned(), ..DiscordConfig::default() },
+            None,
+            Some(fake.dir().to_path_buf()),
+            Duration::ZERO,
+        );
+        hub.set_discord(Some(discord.sink()));
+        assert!(fake.next_handshake(Duration::from_secs(5)).is_some(), "the fake Discord handshook");
+        // A real Last.fm client against the mock API.
+        let lastfm = LastFm::start(Arc::clone(&waker));
+        hub.set_lastfm(Some(lastfm.sink()));
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
+        let worker_hub = Arc::clone(&hub);
+        let handle = std::thread::spawn(move || worker(cmd_rx, ev_tx, waker, None, worker_hub));
+        cmd_tx.send(Cmd::SetVolume(0.0)).unwrap();
+        cmd_tx.send(Cmd::SetMuted(true)).unwrap();
+        cmd_tx
+            .send(Cmd::PlayLocal {
+                seq: 1,
+                path: a_path.clone(),
+                quality: "WAV 16-bit/44.1 kHz".to_owned(),
+                replaygain: None,
+                track: a.clone(),
+            })
+            .unwrap();
+        cmd_tx
+            .send(Cmd::SetUpcoming {
+                after: Some(a.id),
+                tracks: vec![local_entry(b.clone(), b_path.clone())],
+                cyclic: false,
+            })
+            .unwrap();
+
+        // Wait for the queue to run out, with nothing consuming the UI's events.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut events: Vec<Ev> = Vec::new();
+        while !matches!(events.last(), Some(Ev::TrackFinished { .. } | Ev::PlaybackEnded { .. }))
+            && Instant::now() < deadline
+        {
+            while let Ok(ev) = ev_rx.try_recv() {
+                events.push(ev);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(events.last(), Some(Ev::TrackFinished { .. })),
+            "the queue played through: {:?}",
+            events.iter().map(event_name).collect::<Vec<_>>()
+        );
+
+        // Discord: the presence followed a, then b, and was cleared at the end.
+        let played = |frame: &serde_json::Value| {
+            frame["args"]["activity"]["details"].as_str().map(str::to_owned)
+        };
+        let (_, first) = fake.next_frame(Duration::from_secs(5)).expect("a presence for a");
+        assert_eq!(played(&first).as_deref(), Some("Aa"), "{first}");
+        let (_, second) = fake.next_frame(Duration::from_secs(5)).expect("a presence for b");
+        assert_eq!(played(&second).as_deref(), Some("Bb"), "{second}");
+        let (_, cleared) = fake.next_frame(Duration::from_secs(5)).expect("the presence cleared");
+        assert!(cleared["args"]["activity"].is_null(), "{cleared}");
+
+        // Last.fm: both tracks were announced, and a's play was scrobbled (its title arrives as
+        // the indexed `track[0]` of the batch).
+        let sent = || {
+            mock.requests()
+                .iter()
+                .map(|params| {
+                    let field = |name: &str| {
+                        params.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone())
+                    };
+                    let title = field("track").or_else(|| field("track[0]")).unwrap_or_default();
+                    (field("method").unwrap_or_default(), title)
+                })
+                .collect::<Vec<(String, String)>>()
+        };
+        let wait_for = |wanted: &[(&str, &str)]| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let requests = sent();
+                if wanted.iter().all(|(method, title)| {
+                    requests.iter().any(|(sent, sent_title)| sent == method && sent_title == title)
+                }) {
+                    return requests;
+                }
+                assert!(Instant::now() < deadline, "Last.fm never received {wanted:?}: {requests:?}");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+        wait_for(&[
+            ("track.updateNowPlaying", "Aa"),
+            ("track.updateNowPlaying", "Bb"),
+            ("track.scrobble", "Aa"),
+        ]);
+
+        // MPRIS: the metadata moved with the tracks, then cleared as playback stopped.
+        let calls = mpris.calls();
+        let titles: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| call.strip_prefix("metadata:"))
+            .filter(|title| !title.is_empty())
+            .collect();
+        assert_eq!(titles, ["Aa", "Bb"], "MPRIS showed a, then b: {calls:?}");
+        let cleared =
+            calls.iter().position(|call| call == "metadata:").expect("the metadata cleared");
+        let stopped = calls
+            .iter()
+            .position(|call| call == "playback:Stopped")
+            .expect("MPRIS reported stopped");
+        assert!(cleared < stopped, "the clear came first: {calls:?}");
+        assert_eq!(calls.last().map(String::as_str), Some("position:0"), "{calls:?}");
+
+        cmd_tx.send(Cmd::Stop).unwrap();
+        drop(cmd_tx);
+        let _ = handle.join();
+        // SAFETY: as above; the test that set them is done with the thread.
+        unsafe {
+            std::env::remove_var("TSUN_LASTFM_API_BASE");
+            std::env::remove_var("TSUN_LASTFM_MIN_TRACK_SECS");
+            std::env::remove_var("TSUN_LASTFM_MIN_PLAYED_SECS");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Records what the media hub published to MPRIS, so a test can assert it without a bus.
+    #[derive(Default)]
+    struct RecordingMpris {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingMpris {
+        fn push(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::media_hub::MprisSink for RecordingMpris {
+        fn set_metadata(&self, metadata: crate::mpris::MprisMeta) {
+            self.push(format!("metadata:{}", metadata.title));
+        }
+
+        fn set_playback(&self, playback: crate::mpris::MprisPlayback) {
+            self.push(format!("playback:{playback:?}"));
+        }
+
+        fn set_can_go(&self, next: bool, previous: bool) {
+            self.push(format!("can_go:{next}:{previous}"));
+        }
+
+        fn set_volume(&self, volume: f64) {
+            self.push(format!("volume:{volume}"));
+        }
+
+        fn set_position(&self, position_us: i64) {
+            // Only the changes matter, and they come once a second.
+            if position_us == 0 {
+                self.push("position:0".to_owned());
+            }
+        }
+
+        fn emit_seeked(&self, position_us: i64) {
+            self.push(format!("seeked:{position_us}"));
+        }
+    }
+
     fn event_name(ev: &Ev) -> &'static str {
         match ev {
             Ev::Ready { .. } => "Ready",
@@ -1230,6 +1529,7 @@ mod tests {
             ev_tx,
             waker,
             trace: None,
+            media: crate::media_hub::MediaHub::new(),
             stalled_reported: false,
         }
     }
@@ -1265,7 +1565,8 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (ev_tx, _ev_rx) = mpsc::channel::<Ev>();
         let waker: Waker = Arc::new(|| {});
-        let handle = std::thread::spawn(move || worker(cmd_rx, ev_tx, waker, None));
+        let media = crate::media_hub::MediaHub::new();
+        let handle = std::thread::spawn(move || worker(cmd_rx, ev_tx, waker, None, media));
         drop(cmd_tx);
         handle.join().expect("the worker exits when the UI is gone");
     }

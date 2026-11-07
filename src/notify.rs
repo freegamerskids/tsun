@@ -40,8 +40,19 @@ pub(crate) struct Notification {
 }
 
 /// Posts track-change notifications from a background thread.
+///
+/// Cloneable because the media hub holds one of its own: it posts what the audio side reports
+/// even while no frame is running. The thread (and the bus connection it owns) lives until the
+/// last clone is dropped, so switching notifications off drops both the UI's handle and the
+/// hub's.
 pub(crate) struct Notifier {
     tx: Sender<Notification>,
+}
+
+impl Clone for Notifier {
+    fn clone(&self) -> Self {
+        Notifier { tx: self.tx.clone() }
+    }
 }
 
 impl Notifier {

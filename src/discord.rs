@@ -197,6 +197,21 @@ enum Command {
 }
 
 type SharedStatus = Arc<Mutex<Status>>;
+/// The presence a client last published, shared with its [`DiscordSink`] so a paused or seeked
+/// event folds into the same one.
+type SharedPresence = Arc<Mutex<Option<Presence>>>;
+
+/// A handle to a running client's presence, for a thread that is not the UI thread.
+///
+/// The media hub holds one so playback events reach Discord even while the window is not being
+/// drawn (and its `poll` is therefore not running); it is a clone of what the [`Discord`] struct
+/// itself uses, so both see the same current presence and the same status.
+#[derive(Clone)]
+pub(crate) struct DiscordSink {
+    tx: Sender<Command>,
+    status: SharedStatus,
+    current: SharedPresence,
+}
 
 /// A running Discord client. Dropping it stops the thread and clears the presence.
 pub(crate) struct Discord {
@@ -204,7 +219,7 @@ pub(crate) struct Discord {
     status: SharedStatus,
     /// The presence last handed to [`Discord::show`] / [`Discord::update`], so a paused or
     /// seeked event can be folded into it.
-    current: Mutex<Option<Presence>>,
+    current: SharedPresence,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -241,9 +256,44 @@ impl Discord {
                 .spawn(move || run(config, rx, status, wake, runtime, min_interval, shutdown))
                 .ok()
         };
-        Discord { tx, status, current: Mutex::new(None), shutdown, thread }
+        Discord { tx, status, current: Arc::new(Mutex::new(None)), shutdown, thread }
     }
 
+    /// The handle another thread (the media hub) uses to drive this client's presence.
+    ///
+    /// It shares the client's current presence and status, so events from either side fold into
+    /// the same activity.
+    pub(crate) fn sink(&self) -> DiscordSink {
+        DiscordSink {
+            tx: self.tx.clone(),
+            status: Arc::clone(&self.status),
+            current: Arc::clone(&self.current),
+        }
+    }
+
+    /// Republishes the presence for the track playing right now. A client started with a
+    /// different Application ID is a new Discord session, and Discord dropped what the old one
+    /// had published, so the current track has to go out again.
+    pub(crate) fn republish(&self, track: &MediaTrack, position_secs: f64, paused: bool) {
+        self.sink().republish(track, position_secs, paused);
+    }
+
+    /// Applies changed display switches without reconnecting.
+    pub(crate) fn configure(&self, config: Config) {
+        self.send(Command::Configure(config));
+    }
+
+    /// The connection state, for the Settings card.
+    pub(crate) fn status(&self) -> Status {
+        self.sink().status()
+    }
+
+    fn send(&self, command: Command) {
+        let _ = self.tx.send(command);
+    }
+}
+
+impl DiscordSink {
     /// Publishes `presence` (a new track, or the same one after a change).
     pub(crate) fn show(&self, presence: Presence) {
         *self.current.lock().unwrap() = Some(presence.clone());
@@ -273,16 +323,14 @@ impl Discord {
         self.update(position_secs, paused);
     }
 
-    /// Republishes the presence for the track playing right now. A client started with a
-    /// different Application ID is a new Discord session, and Discord dropped what the old one
-    /// had published, so the current track has to go out again.
+    /// Republishes the presence for the track playing right now.
     pub(crate) fn republish(&self, track: &MediaTrack, position_secs: f64, paused: bool) {
         self.show(presence_of(track, position_secs, paused));
     }
 
-    /// Follows one playback event from the app's now-playing lifecycle (see
-    /// [`Ui::emit_media`](crate::app::Ui::emit_media)). Cheap: it folds the event into the
-    /// presence and hands it to the thread, which coalesces and rate-limits the frames.
+    /// Follows one playback event from the now-playing lifecycle. Cheap: it folds the event into
+    /// the presence and hands it to the client's thread, which coalesces and rate-limits the
+    /// frames.
     pub(crate) fn media_event(&self, event: &MediaEvent) {
         match event {
             MediaEvent::Started { track, position_secs } => {
@@ -294,11 +342,6 @@ impl Discord {
             MediaEvent::Seeked { position_secs } => self.seek(*position_secs),
             MediaEvent::Stopped | MediaEvent::Finished => self.clear(),
         }
-    }
-
-    /// Applies changed display switches without reconnecting.
-    pub(crate) fn configure(&self, config: Config) {
-        self.send(Command::Configure(config));
     }
 
     /// The connection state, for the Settings card.
@@ -901,7 +944,7 @@ fn notify(wake: &Option<Wake>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::fs;
@@ -1209,7 +1252,9 @@ mod tests {
     // The fake Discord
 
     /// A fake Discord IPC server: hands out raw frames and collects what the client sent.
-    struct FakeDiscord {
+    ///
+    /// `pub(crate)` so the worker's integration test can assert the presence the *hub* drives.
+    pub(crate) struct FakeDiscord {
         dir: TempDir,
         received: Receiver<(u32, Value)>,
         handshakes: Receiver<Value>,
@@ -1220,7 +1265,7 @@ mod tests {
         /// `user`, and forwards every later frame. `close_after_first` drops the first
         /// connection once its first `SET_ACTIVITY` has arrived, which is how a reconnect
         /// (Discord restarting) is provoked.
-        fn start(name: &str, connections: usize, user: &str, close_after_first: bool) -> FakeDiscord {
+        pub(crate) fn start(name: &str, connections: usize, user: &str, close_after_first: bool) -> FakeDiscord {
             let dir = temp_dir(name);
             let path = dir.path().join("discord-ipc-0");
             let listener = UnixListener::bind(&path).unwrap();
@@ -1264,15 +1309,15 @@ mod tests {
         }
 
         /// The next frame the client sent, within `timeout`.
-        fn next_frame(&self, timeout: Duration) -> Option<(u32, Value)> {
+        pub(crate) fn next_frame(&self, timeout: Duration) -> Option<(u32, Value)> {
             self.received.recv_timeout(timeout).ok()
         }
 
-        fn next_handshake(&self, timeout: Duration) -> Option<Value> {
+        pub(crate) fn next_handshake(&self, timeout: Duration) -> Option<Value> {
             self.handshakes.recv_timeout(timeout).ok()
         }
 
-        fn dir(&self) -> &Path {
+        pub(crate) fn dir(&self) -> &Path {
             self.dir.path()
         }
     }
@@ -1327,7 +1372,7 @@ mod tests {
 
         let mut current = presence("A Title");
         current.position_secs = 30.0;
-        discord.show(current);
+        discord.sink().show(current);
         let (op, frame) = fake.next_frame(Duration::from_secs(5)).expect("a SET_ACTIVITY frame");
         assert_eq!(op, OP_FRAME);
         assert_eq!(frame["cmd"], json!("SET_ACTIVITY"));
@@ -1336,7 +1381,7 @@ mod tests {
         assert!(frame["nonce"].is_string());
 
         // Pausing republishes without timestamps, resuming puts them back.
-        discord.update(30.0, true);
+        discord.sink().update(30.0, true);
         let (_, paused) = fake.next_frame(Duration::from_secs(5)).expect("a pause frame");
         assert!(paused["args"]["activity"]["timestamps"].is_null());
         assert_eq!(paused["args"]["activity"]["state"], json!("Paused · An Artist"));
@@ -1358,7 +1403,7 @@ mod tests {
         );
         assert!(fake.next_handshake(Duration::from_secs(5)).is_some());
         assert!(wait_status(&discord, Duration::from_secs(5), Status::is_connected).is_connected());
-        discord.show(presence("A Title"));
+        discord.sink().show(presence("A Title"));
         let (_, first) = fake.next_frame(Duration::from_secs(5)).expect("the first publication");
         assert_eq!(first["args"]["activity"]["details"], json!("A Title"));
         // The fake closes the connection, so the client reconnects and republishes by itself.
@@ -1379,14 +1424,14 @@ mod tests {
 
         let mut first = presence("Skipped 1");
         first.position_secs = 0.0;
-        discord.show(first);
+        discord.sink().show(first);
         let (_, sent) = fake.next_frame(Duration::from_secs(5)).expect("the first update");
         assert_eq!(sent["args"]["activity"]["details"], json!("Skipped 1"));
 
         // Three more changes in a row: only the last one may reach Discord.
-        discord.show(presence("Skipped 2"));
-        discord.update(5.0, false);
-        discord.show(presence("Kept"));
+        discord.sink().show(presence("Skipped 2"));
+        discord.sink().update(5.0, false);
+        discord.sink().show(presence("Kept"));
         let (_, coalesced) = fake.next_frame(Duration::from_secs(5)).expect("the coalesced update");
         assert_eq!(coalesced["args"]["activity"]["details"], json!("Kept"), "{coalesced}");
         assert!(coalesced["args"]["activity"]["timestamps"].is_object(), "{coalesced}");
@@ -1523,7 +1568,7 @@ mod tests {
             cover_url: None,
             local: false,
         };
-        discord.media_event(&MediaEvent::Started { track: media.clone(), position_secs: 0.0 });
+        discord.sink().media_event(&MediaEvent::Started { track: media.clone(), position_secs: 0.0 });
         let (_, started) = fake.next_frame(Duration::from_secs(5)).expect("the started frame");
         assert_eq!(started["args"]["activity"]["details"], json!("Song"));
         assert_eq!(started["args"]["activity"]["state"], json!("Band"));
@@ -1532,46 +1577,47 @@ mod tests {
             json!("https://tidal.com/browse/track/42")
         );
 
-        discord.media_event(&MediaEvent::Paused { position_secs: 30.0 });
+        discord.sink().media_event(&MediaEvent::Paused { position_secs: 30.0 });
         let (_, paused) = fake.next_frame(Duration::from_secs(5)).expect("the pause frame");
         assert!(paused["args"]["activity"]["timestamps"].is_null());
         assert_eq!(paused["args"]["activity"]["state"], json!("Paused · Band"));
 
-        discord.media_event(&MediaEvent::Stopped);
+        discord.sink().media_event(&MediaEvent::Stopped);
         let (_, cleared) = fake.next_frame(Duration::from_secs(5)).expect("the clear frame");
         assert!(cleared["args"]["activity"].is_null(), "{cleared}");
     }
 
+    /// The media hub's fan-out reaches the wire: a TIDAL track carries the cover and the TIDAL
+    /// button, a local file carries neither, and the bar follows a seek and a pause. This is the
+    /// path the *worker* drives, which is what keeps the presence moving while no frame is drawn.
     #[test]
-    fn the_ui_fan_out_reaches_the_wire_for_tidal_tracks_and_local_files() {
-        use crate::app::{NowPlaying, init};
+    fn the_hub_fan_out_reaches_the_wire_for_tidal_tracks_and_local_files() {
+        use crate::media_events::{MediaEvent, MediaTrack};
 
         let fake = FakeDiscord::start("fanout", 1, "tester", false);
-        let mut ui = init();
-        ui.discord = Some(Discord::start_with(
+        let hub = crate::media_hub::MediaHub::new();
+        let discord = Discord::start_with(
             config("12345678901234567"),
             None,
             Some(fake.dir().to_path_buf()),
             Duration::ZERO,
-        ));
+        );
+        hub.set_discord(Some(discord.sink()));
         assert!(fake.next_handshake(Duration::from_secs(5)).is_some());
+        assert!(wait_status(&discord, Duration::from_secs(5), Status::is_connected).is_connected());
 
-        // A TIDAL track starting: the app's own lifecycle emits the event, which must arrive at
-        // Discord as a Listening activity with the cover, the bar and the TIDAL button.
-        ui.now_playing = Some(NowPlaying {
-            id: 42,
+        // A TIDAL track starting: the event the worker sends, which must arrive at Discord as a
+        // Listening activity with the cover, the bar and the TIDAL button.
+        let media = MediaTrack {
+            id: "42".to_owned(),
             title: "Song".to_owned(),
             artist: "Band".to_owned(),
             album: "Disc".to_owned(),
-            cover: Some("01234567-89ab-cdef-0123-456789abcdef".to_owned()),
-            album_id: None,
-            artist_id: None,
-            elapsed: 0,
-            duration: Some(120),
-            quality: None,
-            output: None,
-        });
-        ui.media_started(0.0);
+            duration_secs: Some(120),
+            cover_url: Some("01234567-89ab-cdef-0123-456789abcdef".to_owned()),
+            local: false,
+        };
+        hub.dispatch_now(MediaEvent::Started { track: media.clone(), position_secs: 0.0 });
         let (_, started) = fake.next_frame(Duration::from_secs(5)).expect("the started frame");
         let activity = &started["args"]["activity"];
         assert_eq!(activity["details"], json!("Song"));
@@ -1585,41 +1631,36 @@ mod tests {
         assert_eq!(activity["buttons"][0]["url"], json!("https://tidal.com/browse/track/42"));
 
         // A seek, then a pause: the bar follows the position and a pause says so.
-        ui.now_playing.as_mut().unwrap().elapsed = 30;
-        ui.media_seeked(30.0);
+        hub.dispatch_now(MediaEvent::Seeked { position_secs: 30.0 });
         let (_, seeked) = fake.next_frame(Duration::from_secs(5)).expect("the seeked frame");
         let timestamps = &seeked["args"]["activity"]["timestamps"];
         let start = timestamps["start"].as_i64().expect("a start");
         assert_eq!(timestamps["end"].as_i64(), Some(start + 120));
-        ui.media_pause_changed(true, 30.0);
+        hub.dispatch_now(MediaEvent::Paused { position_secs: 30.0 });
         let (_, paused) = fake.next_frame(Duration::from_secs(5)).expect("the paused frame");
         assert!(paused["args"]["activity"]["timestamps"].is_null());
         assert_eq!(paused["args"]["activity"]["state"], json!("Paused · Band"));
 
         // A local file: same presence, no TIDAL button (local ids have no TIDAL page).
         let local_id = crate::local::local_id(std::path::Path::new("/music/song.flac"));
-        ui.now_playing = Some(NowPlaying {
-            id: local_id,
+        let local = MediaTrack {
+            id: local_id.to_string(),
             title: "Local Song".to_owned(),
             artist: "Local Band".to_owned(),
             album: "Local Disc".to_owned(),
-            cover: None,
-            album_id: None,
-            artist_id: None,
-            elapsed: 0,
-            duration: Some(200),
-            quality: None,
-            output: None,
-        });
-        ui.media_started(0.0);
-        let (_, local) = fake.next_frame(Duration::from_secs(5)).expect("the local frame");
-        let activity = &local["args"]["activity"];
+            duration_secs: Some(200),
+            cover_url: None,
+            local: true,
+        };
+        hub.dispatch_now(MediaEvent::Started { track: local, position_secs: 0.0 });
+        let (_, frame) = fake.next_frame(Duration::from_secs(5)).expect("the local frame");
+        let activity = &frame["args"]["activity"];
         assert_eq!(activity["details"], json!("Local Song"), "{activity}");
         assert!(activity["buttons"].is_null(), "a local file must not get a TIDAL button");
         assert!(activity["assets"].is_null(), "a local file has no TIDAL cover");
 
         // Stopping clears it.
-        ui.media_stopped();
+        hub.dispatch_now(MediaEvent::Stopped);
         let (_, cleared) = fake.next_frame(Duration::from_secs(5)).expect("the cleared frame");
         assert!(cleared["args"]["activity"].is_null());
     }
@@ -1638,7 +1679,7 @@ mod tests {
         assert!(fake.next_handshake(Duration::from_secs(5)).is_some());
         let mut current = presence("A Title");
         current.position_secs = 5.0;
-        discord.show(current);
+        discord.sink().show(current);
         let (_, frame) = fake.next_frame(Duration::from_secs(5)).expect("the activity frame");
         let activity = &frame["args"]["activity"];
         assert_eq!(activity["name"], json!("TIDAL"), "the name overrides the application name");
@@ -1799,7 +1840,7 @@ mod tests {
             Some(dir.path().to_path_buf()),
             Duration::ZERO,
         );
-        discord.show(presence("Queued"));
+        discord.sink().show(presence("Queued"));
         assert_eq!(wait_status(&discord, Duration::from_secs(5), |s| *s == Status::NotRunning), Status::NotRunning);
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx) = mpsc::channel();

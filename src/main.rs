@@ -18,6 +18,7 @@ mod history_log;
 mod lastfm;
 mod local;
 mod media_events;
+mod media_hub;
 mod mpris;
 mod notify;
 mod playback;

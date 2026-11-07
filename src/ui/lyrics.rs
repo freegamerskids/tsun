@@ -216,4 +216,36 @@ mod tests {
             .map_or(0, |playing| playing.elapsed.saturating_mul(1000));
         assert_eq!(highlighted_line(&timed(), elapsed_ms), Some(1));
     }
+
+    /// With the full-screen view up, the lyrics dock behind it must not be built: two viewports
+    /// share the `lyrics-scroll` key and the auto-scroll would drive the hidden one.
+    #[test]
+    fn the_full_screen_view_has_the_only_lyrics_viewport() {
+        let viewports = |full_screen: bool| {
+            let mut s = init();
+            s.now_playing = Some(NowPlaying {
+                id: 7,
+                title: "Track".to_owned(),
+                artist: "Artist".to_owned(),
+                album: "Album".to_owned(),
+                cover: None,
+                album_id: None,
+                artist_id: None,
+                elapsed: 6,
+                duration: Some(180),
+                quality: None,
+                output: None,
+            });
+            s.lyrics = Some((7, Some(timed())));
+            s.lyrics_state = SearchState::Done;
+            s.lyrics_open = true;
+            s.now_playing_open = full_screen;
+            let mut rt = rune::Runtime::new(s, crate::ui::view, (1400.0, 800.0), rune::Env::new(true, 1.0));
+            rt.frame(0.0);
+            let keys: Vec<String> = rt.elements().into_iter().filter_map(|element| element.key).collect();
+            keys.iter().filter(|key| *key == "lyrics-scroll").count()
+        };
+        assert_eq!(viewports(false), 1, "the dock, with the full-screen view closed");
+        assert_eq!(viewports(true), 1, "only the full-screen view's viewport while it is up");
+    }
 }

@@ -471,6 +471,8 @@ pub(crate) struct Ui {
     pub(crate) suggest_selected: Option<usize>,
     /// Set when Escape hides the dropdown; typing clears it again.
     pub(crate) suggest_dismissed: bool,
+    /// Whether the pointer is over the suggestions list (keeps it open while a press moves focus).
+    pub(crate) suggest_hover: bool,
     /// The box text `poll` last saw, and when it last changed, for the debounce.
     pub(crate) suggest_seen: String,
     pub(crate) suggest_edited_at: Option<f64>,
@@ -493,6 +495,11 @@ pub(crate) struct Ui {
     pub(crate) lyrics_state: SearchState,
     /// The last highlighted lyrics line, so `poll` scrolls only when it changes.
     pub(crate) lyrics_line: Option<usize>,
+    /// Whether the full-screen view was up when the lyrics last scrolled, to scroll again when
+    /// it opens or closes (a new viewport starts at the top).
+    pub(crate) lyrics_overlay_seen: bool,
+    /// Frames left to repeat the lyrics scroll request for a viewport that was just mounted.
+    pub(crate) lyrics_scroll_retry: u8,
     /// Whether the lyrics panel is shown; the player bar's toggle flips it.
     pub(crate) lyrics_open: bool,
     /// Whether the full-screen Now Playing overlay is up.
@@ -746,6 +753,7 @@ pub(crate) fn init() -> Ui {
         suggest_seq: 0,
         suggest_selected: None,
         suggest_dismissed: false,
+        suggest_hover: false,
         suggest_seen: String::new(),
         suggest_edited_at: None,
         suggest_query: String::new(),
@@ -759,6 +767,8 @@ pub(crate) fn init() -> Ui {
         lyrics: None,
         lyrics_state: SearchState::Idle,
         lyrics_line: None,
+        lyrics_overlay_seen: false,
+        lyrics_scroll_retry: 0,
         lyrics_open: false,
         now_playing_open: false,
         preload: GaplessState::new(),
@@ -1186,9 +1196,22 @@ fn tick_lyrics_scroll(s: &mut Ui, tx: &mut Tx) {
     else {
         return;
     };
+    // Opening or closing the full-screen view mounts a fresh lyrics viewport, which starts at
+    // the top: scroll it to the current line again.
+    if s.lyrics_overlay_seen != s.now_playing_open {
+        s.lyrics_overlay_seen = s.now_playing_open;
+        s.lyrics_line = None;
+    }
     if s.lyrics_line != Some(line) {
         s.lyrics_line = Some(line);
+        // A newly mounted viewport is laid out a frame or two after this poll, so the request
+        // is repeated for a few frames; scrolling to a line already centred is a no-op.
+        s.lyrics_scroll_retry = 4;
+    }
+    if s.lyrics_scroll_retry > 0 {
+        s.lyrics_scroll_retry -= 1;
         tx.scroll_center_in("lyrics-scroll", format!("lyric-{line}"));
+        tx.wake_after(Duration::from_millis(16));
     }
 }
 
@@ -2522,7 +2545,12 @@ impl Ui {
 
     /// Whether the suggestion dropdown belongs under the search box.
     pub(crate) fn search_dropdown_open(&self) -> bool {
-        self.query.focused && !self.suggest_dismissed && !self.search_suggest_list().is_empty()
+        // Pressing a row moves the keyboard focus onto it, which blurs the search box; the
+        // pointer being over the list keeps it up so the press can finish (without this a
+        // click on a recent search removed the list before the button came up).
+        (self.query.focused || self.suggest_hover)
+            && !self.suggest_dismissed
+            && !self.search_suggest_list().is_empty()
     }
 
     /// Clears the suggestion list (a search ran, or the box was emptied).
@@ -2543,6 +2571,7 @@ impl Ui {
         self.suggest_seen = self.query.text.clone();
         self.suggest_edited_at = None;
         self.suggest_dismissed = true;
+        self.suggest_hover = false;
         self.close_suggestions();
         self.submit_search();
     }

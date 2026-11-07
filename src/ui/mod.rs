@@ -66,7 +66,9 @@ pub(crate) fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
     if s.queue_open {
         body = body.child(queue::queue_panel(s, p));
     }
-    if s.lyrics_open {
+    // The full-screen Now Playing view shows its own lyrics; a second viewport behind it would
+    // share the `lyrics-scroll` key and win the auto-scroll.
+    if s.lyrics_open && !s.now_playing_open {
         body = body.child(
             col()
                 .key("lyrics-dock")

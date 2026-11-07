@@ -102,7 +102,7 @@ fn now_playing_area(s: &Ui, p: Palette, playing: Option<&crate::app::NowPlaying>
         .child(artist_el)
         .child(text(album).font(SMALL).color(p.faint).truncate());
 
-    let mut area = row().w(300.0).min_w(0.0).gap(12.0).center_y().child(cover_el);
+    let mut area = row().w(0.0).grow(1.0).min_w(300.0).gap(12.0).center_y().child(cover_el);
     area = area.child(info);
     // Local files are not TIDAL favourites, so they get no heart at all.
     if let Some(id) = playing.map(|track| track.id).filter(|id| !crate::local::is_local_id(*id)) {
@@ -203,7 +203,7 @@ fn transport_area(s: &Ui, p: Palette, playing: Option<&crate::app::NowPlaying>) 
         .child(transport)
         .child(next)
         .child(repeat);
-    let mut middle = col().grow(1.0).min_w(0.0).center().gap(2.0).child(controls);
+    let mut middle = col().w(480.0).min_w(0.0).center().gap(2.0).child(controls);
     if let Some(track) = playing {
         if let Some(duration) = track.duration.filter(|duration| *duration > 0) {
             let fraction = s.scrub.unwrap_or_else(|| track.elapsed.min(duration) as f32 / duration as f32);
@@ -335,7 +335,9 @@ fn right_area(s: &Ui, p: Palette, playing: Option<&crate::app::NowPlaying>) -> E
         });
     }
 
-    let mut right = row().w(380.0).center_y().justify_end().gap(10.0);
+    // Equal flexible share with the left block (the transport sits between them), but never
+    // narrower than its own controls need.
+    let mut right = row().w(0.0).grow(1.0).min_w(380.0).center_y().justify_end().gap(10.0);
     if !quality.is_empty() {
         // The tooltip carries the format the device actually accepted, not just the tier.
         let tooltip = match playing.and_then(|track| track.output.as_deref()) {
@@ -710,5 +712,43 @@ mod tests {
         rt.frame(0.0);
         notch(&mut rt, (vx, vy), -40.0);
         assert_eq!(rt.state.settings.volume, 0.0, "and at the bottom");
+    }
+}
+
+#[cfg(test)]
+mod centring_tests {
+    use super::*;
+    use crate::app::{NowPlaying, init};
+    use crate::theme::palette;
+
+    fn bar_view(s: &Ui, _: &mut rune::Cx<Ui>) -> El {
+        player_bar(s, palette())
+    }
+
+    /// The play/pause button sits in the middle of the window, whatever the widths of the
+    /// now-playing block on the left and the volume block on the right (they share the rest
+    /// equally; the transport used to be pushed left because the right block was wider).
+    #[test]
+    fn the_transport_is_centred_in_the_window() {
+        for width in [1400.0f32, 1568.0, 1920.0] {
+            let mut s = init();
+            s.now_playing = Some(NowPlaying {
+                id: 7,
+                title: "Track".to_owned(),
+                artist: "Artist".to_owned(),
+                album: "Album".to_owned(),
+                cover: None,
+                album_id: None,
+                artist_id: None,
+                elapsed: 6,
+                duration: Some(180),
+                quality: None,
+                output: None,
+            });
+            let mut rt = rune::Runtime::new(s, bar_view, (width, 84.0), rune::Env::new(true, 1.0));
+            rt.frame(0.0);
+            let (x, _) = rt.find("transport").expect("play/pause button");
+            assert!((x - width / 2.0).abs() < 1.5, "width {width}: play/pause at {x}, window centre {}", width / 2.0);
+        }
     }
 }

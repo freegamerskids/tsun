@@ -362,7 +362,8 @@ pub(crate) fn suggestions_dropdown(s: &Ui, p: Palette) -> El {
         .padding(6.0)
         .radius(10.0)
         .fill(p.card)
-        .border(1.0, p.border);
+        .border(1.0, p.border)
+        .on_hover_change(|s: &mut Ui, over: bool, _: &mut rune::Tx| s.suggest_hover = over);
     menu = menu.child(
         row()
             .w_full()
@@ -414,3 +415,30 @@ pub(crate) fn suggestions_dropdown(s: &Ui, p: Palette) -> El {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use crate::app::{Login, init};
+
+    /// Pressing a row of the recent-searches list moves the focus onto the row, which blurs the
+    /// search box; the list must stay up until the press finishes so the click searches again.
+    #[test]
+    fn clicking_a_recent_search_runs_it_again() {
+        let mut s = init();
+        s.login = Login::LoggedIn;
+        s.recent_searches = vec!["daft punk".to_owned(), "yoasobi".to_owned()];
+        s.query.focused = true;
+        let mut rt = rune::Runtime::new(s, crate::ui::view, (1280.0, 800.0), rune::Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (x, y) = rt.find("suggestion-1").expect("the recent-search rows are shown");
+        rt.pointer_move(x, y);
+        rt.frame(0.0);
+        rt.pointer_down(x, y);
+        rt.frame(0.0);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.query.text, "yoasobi", "the clicked recent search is now the query");
+        assert!(rt.state.last_query == "yoasobi" || rt.state.search_state != crate::app::SearchState::Idle,
+            "and the search was started");
+    }
+}

@@ -942,7 +942,9 @@ impl Client {
             }
         }
         tracks.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(tracks.into_iter().map(|(_, track)| track).collect())
+        // TIDAL pads this list with repeated entries (a different set each request: a library
+        // of 306 distinct tracks came back as 331 entries); each track appears once.
+        Ok(dedupe_by(tracks.into_iter().map(|(_, track)| track).collect(), |track| track.id))
     }
 
     /// The signed-in user's favourite albums, newest first, across every page.
@@ -957,7 +959,7 @@ impl Client {
             }
         }
         albums.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(albums.into_iter().map(|(_, album)| album).collect())
+        Ok(dedupe_by(albums.into_iter().map(|(_, album)| album).collect(), |album| album.id))
     }
 
     /// The signed-in user's favourite music videos, newest first, across every page.
@@ -972,7 +974,7 @@ impl Client {
             }
         }
         videos.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(videos.into_iter().map(|(_, video)| video).collect())
+        Ok(dedupe_by(videos.into_iter().map(|(_, video)| video).collect(), |video| video.id))
     }
 
     /// The signed-in user's favourite artists, newest first, across every page.
@@ -987,7 +989,7 @@ impl Client {
             }
         }
         artists.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(artists.into_iter().map(|(_, artist)| artist).collect())
+        Ok(dedupe_by(artists.into_iter().map(|(_, artist)| artist).collect(), |artist| artist.id))
     }
 
     /// The user's playlists: the ones they own plus the ones they favourited,
@@ -3502,6 +3504,14 @@ fn worth_probing(best_rank: Option<u8>, requested: &str) -> bool {
     best_rank.map_or(true, |best| quality_rank(Some(requested)) > best)
 }
 
+/// Drops every item whose key was already seen, keeping the first of each in order. TIDAL pads
+/// its favourites lists with repeated entries (and which ones repeat changes from request to
+/// request), so each track, album, artist or video is kept once.
+fn dedupe_by<T, K: std::hash::Hash + Eq>(items: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    items.into_iter().filter(|item| seen.insert(key(item))).collect()
+}
+
 /// The v2 resource that serves track manifests listing the formats a track can be played in.
 const OPENAPI_BASE: &str = "https://openapi.tidal.com/v2";
 
@@ -5014,5 +5024,15 @@ mod tests {
         assert_eq!(manifest_formats(Quality::Lossless), Some(&["FLAC", "AACLC"][..]));
         assert_eq!(manifest_formats(Quality::High), None);
         assert_eq!(manifest_formats(Quality::Low), None);
+    }
+
+    /// TIDAL's favourites list repeats entries (a different set each request); each id must
+    /// appear once, at its first (newest) position.
+    #[test]
+    fn favourites_keep_each_id_once_at_its_first_position() {
+        let list = vec![(3u64, "c"), (1, "a"), (3, "c again"), (2, "b"), (1, "a again"), (2, "b again")];
+        let unique = dedupe_by(list, |item| item.0);
+        assert_eq!(unique, vec![(3, "c"), (1, "a"), (2, "b")]);
+        assert!(dedupe_by(Vec::<(u64, &str)>::new(), |item| item.0).is_empty());
     }
 }

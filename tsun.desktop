@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=tsun
+GenericName=Music Player
+Comment=Native TIDAL client with local-file playback
+Exec=tsun %F
+TryExec=tsun
+Icon=tsun
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+MimeType=audio/flac;audio/x-flac;audio/mpeg;audio/mp3;audio/mp4;audio/x-m4a;audio/aac;audio/ogg;audio/vorbis;audio/x-vorbis+ogg;audio/wav;audio/x-wav;audio/aiff;audio/x-aiff;
+StartupNotify=true
+StartupWMClass=tsun

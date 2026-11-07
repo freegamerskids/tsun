@@ -1,0 +1,48 @@
+[package]
+name = "tsun"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "tsun"
+path = "src/main.rs"
+
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "f3d04f3f2069d177d04c963b0ba9f6b2065e46eb", features = ["native-file-dialog"] }
+ureq = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+# Last.fm's api_sig is an MD5 of the sorted parameters plus the shared secret. See src/lastfm.rs.
+md5 = "0.8"
+getrandom = "0.3"
+aes = "0.8"
+cbc = "0.1"
+ctr = "0.9"
+cpal = "0.15"
+# CPU-side cover decoding: the average colour behind the full-screen view and the 480px cover
+# cached for desktop notifications. Already in the tree via rune; only the JPEG decoder is used.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# Local files: FLAC, MP3, AAC/M4A, Vorbis/OGG, WAV and AIFF (Opus has no pure-Rust decoder in
+# symphonia 0.5, so it is not listed in the scanner).
+symphonia = { version = "0.5.5", default-features = false, features = ["flac", "aac", "isomp4", "mp3", "ogg", "vorbis", "wav", "aiff", "pcm", "alac", "adpcm"] }
+# Pure-Rust tag reader/writer for the local library (title, artist, album, track/disc, year,
+# embedded cover, ReplayGain).
+lofty = "0.22"
+# MPRIS2 desktop integration (Linux media keys / panel widgets). See src/mpris.rs.
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+# Video decoding. TIDAL's music videos are H.264 High with B-frames, which the
+# pure-Rust/vendored openh264 decoder cannot decode; libavcodec can, and
+# libavformat's HLS demuxer does the segment fetching and look-ahead.
+ffmpeg-next = "8.1"
+
+# `cargo run` builds the dev profile. Unoptimized, the UI toolkit (layout, text shaping, the
+# renderer) is an order of magnitude slower than in release and long lists stutter, so the
+# dependencies are always optimized and this crate gets a light optimization level; debug info
+# and fast incremental rebuilds of tsun's own code are kept.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

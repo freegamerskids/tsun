@@ -70,9 +70,15 @@ pub(crate) fn video_card(s: &Ui, p: Palette, video: &Video) -> El {
 
 /// A paged Videos carousel for the artist page.
 pub(crate) fn video_carousel(s: &Ui, p: Palette, key: &str, title: &str, videos: &[Video]) -> El {
-    crate::ui::cards::carousel_rows(s, p, key, title, videos.len(), |index| {
-        video_card(s, p, &videos[index])
-    })
+    crate::ui::cards::carousel_rows(
+        s,
+        p,
+        key,
+        title,
+        videos.len(),
+        || crate::ui::cards::ViewAll::videos(title, videos),
+        |index| video_card(s, p, &videos[index]),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -6,11 +6,14 @@
 
 use rune::{Align, Color, El, Icon, TextStyle, col, el, icon, row, spacer, text};
 
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::app::{ArtKind, Ui};
-use crate::theme::{CAPS, H2, ICON_HEART, ICON_HEART_FILLED, ICON_NOTE, ICON_PROFILE, SMALL, TRACK, Palette};
-use crate::tidal::{Album, Artist, FavKind, Playlist, Track};
+use crate::theme::{CAPS, H1, H2, ICON_HEART, ICON_HEART_FILLED, ICON_NOTE, ICON_PROFILE, SMALL, TRACK, Palette};
+use crate::tidal::{Album, Artist, Card, FavKind, Playlist, Track, Video};
+
+use crate::ui::tracks::{ALBUM_H, ARTIST_H, IndexList, PLAYLIST_H, VIDEO_H, grid_page, section, version};
 use crate::widgets::{cover_art, track_count};
 
 pub(crate) use crate::ui::mixes::mix_card;
@@ -165,29 +168,38 @@ pub(crate) fn columns(s: &Ui) -> usize {
 }
 
 /// A titled paged carousel of albums: `columns` visible at a time, with the
-/// `{key}-prev`/`{key}-next` chevrons paging `Ui::carousel_offsets`.
+/// `{key}-prev`/`{key}-next` chevrons paging `Ui::carousel_offsets` and a "View all" button
+/// opening the whole list on its own page.
 pub(crate) fn album_carousel(s: &Ui, p: Palette, key: &str, title: &str, albums: &[Album]) -> El {
-    carousel_rows(s, p, key, title, albums.len(), |index| album_card(s, p, &albums[index]))
+    carousel_rows(s, p, key, title, albums.len(), || ViewAll::albums(title, albums), |index| {
+        album_card(s, p, &albums[index])
+    })
 }
 
 /// A paged carousel of artists.
 pub(crate) fn artist_carousel(s: &Ui, p: Palette, key: &str, title: &str, artists: &[Artist]) -> El {
-    carousel_rows(s, p, key, title, artists.len(), |index| artist_card(s, p, &artists[index]))
+    carousel_rows(s, p, key, title, artists.len(), || ViewAll::artists(title, artists), |index| {
+        artist_card(s, p, &artists[index])
+    })
 }
 
 /// A paged carousel of playlists.
 pub(crate) fn playlist_carousel(s: &Ui, p: Palette, key: &str, title: &str, playlists: &[Playlist]) -> El {
-    carousel_rows(s, p, key, title, playlists.len(), |index| playlist_card(s, p, &playlists[index]))
+    carousel_rows(s, p, key, title, playlists.len(), || ViewAll::playlists(title, playlists), |index| {
+        playlist_card(s, p, &playlists[index])
+    })
 }
 
 /// The shared paged-carousel frame: `cell` draws one card, `columns(s)` are visible at a time and
-/// the chevrons page the offset kept in `Ui::carousel_offsets` under `key`.
+/// the chevrons page the offset kept in `Ui::carousel_offsets` under `key`. A list longer than a
+/// page also gets a "View all" button, which snapshots it through `all` and opens it as a page.
 pub(crate) fn carousel_rows(
     s: &Ui,
     p: Palette,
     key: &str,
     title: &str,
     len: usize,
+    all: impl FnOnce() -> ViewAll,
     mut cell: impl FnMut(usize) -> El,
 ) -> El {
     let columns = columns(s);
@@ -205,22 +217,35 @@ pub(crate) fn carousel_rows(
     let next = at + columns < len;
     let previous_key = format!("{key}-prev");
     let next_key = format!("{key}-next");
-    let previous_press = previous_key.clone();
-    let next_press = next_key.clone();
+    // Both chevrons page the carousel's own offset: the map entry is the carousel's key, while
+    // the chevron keys only name the two buttons.
+    let paged_back = key.to_owned();
+    let paged_on = key.to_owned();
     let step = columns;
-    col().w_full().gap(14.0)
-        .child(row().w_full().center_y().gap(10.0)
-            .child(text(title.to_owned()).font(H2).color(p.text))
-            .child(spacer())
-            .child(page_button(p, &previous_key, "‹", "Previous", previous, move |s: &mut Ui| {
-                let entry = s.carousel_offsets.entry(previous_press.clone()).or_insert(0);
-                *entry = entry.saturating_sub(step);
-            }))
-            .child(page_button(p, &next_key, "›", "Next", next, move |s: &mut Ui| {
-                let entry = s.carousel_offsets.entry(next_press.clone()).or_insert(0);
-                *entry += step;
-            })))
-        .child(line)
+    let mut heading = row().w_full().center_y().gap(10.0)
+        .child(text(title.to_owned()).font(H2).color(p.text))
+        .child(spacer())
+        .child(page_button(p, &previous_key, "‹", "Previous", previous, move |s: &mut Ui| {
+            let entry = s.carousel_offsets.entry(paged_back.clone()).or_insert(0);
+            *entry = entry.saturating_sub(step);
+        }))
+        .child(page_button(p, &next_key, "›", "Next", next, move |s: &mut Ui| {
+            let entry = s.carousel_offsets.entry(paged_on.clone()).or_insert(0);
+            *entry += step;
+        }));
+    // Everything fits on one page: there is nothing more to show, so no button. Otherwise the
+    // whole list is snapshotted once, here, and the button navigates to the page holding it.
+    if len > columns {
+        let snapshot = Rc::new(all());
+        let pressed = snapshot.clone();
+        heading = heading.child(
+            el().key(format!("{key}-all")).role("button").label(format!("View all {title}"))
+                .focusable(true)
+                .on_press(move |s: &mut Ui| s.open_view_all(pressed.clone()))
+                .child(text("View all").font(SMALL).color(p.dim)),
+        );
+    }
+    col().w_full().gap(14.0).child(heading).child(line)
 }
 
 fn page_button(
@@ -239,6 +264,171 @@ fn page_button(
         button = button.hover(p.card_hover).on_press(on);
     }
     button
+}
+
+// ---------------------------------------------------------------------------------------------
+// View all
+
+/// A carousel's whole list, snapshotted when its "View all" button is pressed. The page that
+/// shows it draws the same cards the carousel paged through, as a virtualized grid; the list is
+/// frozen, so what the user reads cannot change under them.
+#[derive(Clone)]
+pub(crate) enum ViewAll {
+    Albums { title: String, items: Vec<Album> },
+    Artists { title: String, items: Vec<Artist> },
+    Playlists { title: String, items: Vec<Playlist> },
+    Videos { title: String, items: Vec<Video> },
+    /// A generic TIDAL section, whose cards mix catalog kinds. `tracks` is the section's own
+    /// track list: a track card in the grid plays it, so next/previous follow the section
+    /// exactly as they do in its carousel.
+    Cards { title: String, items: Vec<Card>, tracks: Rc<Vec<Track>> },
+}
+
+impl ViewAll {
+    pub(crate) fn albums(title: &str, items: &[Album]) -> Self {
+        ViewAll::Albums { title: title.to_owned(), items: items.to_vec() }
+    }
+
+    pub(crate) fn artists(title: &str, items: &[Artist]) -> Self {
+        ViewAll::Artists { title: title.to_owned(), items: items.to_vec() }
+    }
+
+    pub(crate) fn playlists(title: &str, items: &[Playlist]) -> Self {
+        ViewAll::Playlists { title: title.to_owned(), items: items.to_vec() }
+    }
+
+    pub(crate) fn videos(title: &str, items: &[Video]) -> Self {
+        ViewAll::Videos { title: title.to_owned(), items: items.to_vec() }
+    }
+
+    pub(crate) fn cards(title: &str, items: &[Card], tracks: Rc<Vec<Track>>) -> Self {
+        ViewAll::Cards { title: title.to_owned(), items: items.to_vec(), tracks }
+    }
+
+    /// The heading the page shows, which is the carousel's own title.
+    pub(crate) fn title(&self) -> &str {
+        match self {
+            ViewAll::Albums { title, .. }
+            | ViewAll::Artists { title, .. }
+            | ViewAll::Playlists { title, .. }
+            | ViewAll::Videos { title, .. }
+            | ViewAll::Cards { title, .. } => title,
+        }
+    }
+
+    /// How many cards the grid holds.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ViewAll::Albums { items, .. } => items.len(),
+            ViewAll::Artists { items, .. } => items.len(),
+            ViewAll::Playlists { items, .. } => items.len(),
+            ViewAll::Videos { items, .. } => items.len(),
+            ViewAll::Cards { items, .. } => items.len(),
+        }
+    }
+
+    /// The id the snapshot is filed under and the page is navigated to: a hash of what the list
+    /// holds, so pressing "View all" on one carousel twice reuses its entry, and Back and
+    /// Forward find it again after the page has been left.
+    pub(crate) fn id(&self) -> u64 {
+        let ids = match self {
+            ViewAll::Albums { items, .. } => items.iter().map(|album| album.id).collect::<Vec<_>>(),
+            ViewAll::Artists { items, .. } => items.iter().map(|artist| artist.id).collect(),
+            ViewAll::Playlists { items, .. } => items.iter().map(|playlist| string_id(&playlist.id)).collect(),
+            ViewAll::Videos { items, .. } => items.iter().map(|video| video.id).collect(),
+            ViewAll::Cards { items, .. } => items.iter().map(card_id).collect(),
+        };
+        version((kind(self), self.title(), ids))
+    }
+
+    /// The height a grid row is estimated at before layout has measured one.
+    fn estimate(&self) -> f32 {
+        match self {
+            ViewAll::Albums { .. } | ViewAll::Cards { .. } => ALBUM_H,
+            ViewAll::Artists { .. } => ARTIST_H,
+            ViewAll::Playlists { .. } => PLAYLIST_H,
+            ViewAll::Videos { .. } => VIDEO_H,
+        }
+    }
+
+    /// One card of the grid, at `index`.
+    fn card(&self, s: &Ui, p: Palette, index: usize) -> El {
+        match self {
+            ViewAll::Albums { items, .. } => match items.get(index) {
+                Some(album) => album_card(s, p, album),
+                None => el(),
+            },
+            ViewAll::Artists { items, .. } => match items.get(index) {
+                Some(artist) => artist_card(s, p, artist),
+                None => el(),
+            },
+            ViewAll::Playlists { items, .. } => match items.get(index) {
+                Some(playlist) => playlist_card(s, p, playlist),
+                None => el(),
+            },
+            ViewAll::Videos { items, .. } => match items.get(index) {
+                Some(video) => crate::ui::video::video_card(s, p, video),
+                None => el(),
+            },
+            ViewAll::Cards { items, tracks, .. } => match items.get(index) {
+                Some(card) => crate::ui::sections::card_view(s, p, card, tracks, index),
+                None => el(),
+            },
+        }
+    }
+}
+
+/// A type tag, so two kinds holding the same ids and title cannot share a snapshot id.
+fn kind(all: &ViewAll) -> u8 {
+    match all {
+        ViewAll::Albums { .. } => 0,
+        ViewAll::Artists { .. } => 1,
+        ViewAll::Playlists { .. } => 2,
+        ViewAll::Videos { .. } => 3,
+        ViewAll::Cards { .. } => 4,
+    }
+}
+
+/// A stable id for one card of a generic section.
+fn card_id(card: &Card) -> u64 {
+    match card {
+        Card::Album(album) => album.id,
+        Card::Artist(artist) => artist.id,
+        Card::Playlist(playlist) => string_id(&playlist.id),
+        Card::Mix(mix) => string_id(&mix.id),
+        Card::Track(track) => track.id,
+    }
+}
+
+/// The hash of a string id, for the kinds that key their items by one (playlists, mixes).
+fn string_id(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The "View all" page: every item one carousel paged through, in the grid the collection and
+/// search tabs use, under the carousel's title.
+pub(crate) fn view_all_content(s: &Ui, p: Palette, all: &Rc<ViewAll>) -> El {
+    let title = all.title().to_owned();
+    let cards = all.clone();
+    grid_page(
+        s,
+        // The visit counter is part of the key, so opening the page again (even the very same
+        // list, through Back or Forward) mounts a fresh viewport that starts at the top.
+        &format!("view-all-{}-{}", all.id(), s.view_all_visit),
+        IndexList::all(all.len()),
+        all.estimate(),
+        move |s, p, index| cards.card(s, p, index),
+    )
+    .padding(48.0, 12.0, 48.0)
+    .leading(
+        section("header", move |_, p| {
+            col().w_full().child(text(title.clone()).font(H1).color(p.text))
+        })
+        .after(24.0),
+    )
+    .render(s, p)
 }
 
 /// A square track card that starts `play` on a press (the generic-section track card).

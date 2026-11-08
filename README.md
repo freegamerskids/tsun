@@ -182,7 +182,9 @@ few frames), so a commit costs one key check per row plus the rows it mounts, ho
 list is. The page's own blocks — its header, the tab strip, the filter toolbar, a "Top tracks"
 heading, the album's extras — are rows of that same list, so they scroll away with the content as
 before, and the artist page's album, video and similar rows page their cards instead of building
-them all.
+them all. A carousel that holds more than one page of cards also offers "View all" beside its
+chevrons, which opens the whole list as a grid on a page of its own (its own route, so Back and
+Forward work; the carousel's track cards play the section's list there too).
 
 Nothing off screen is built, requested or decoded:
 

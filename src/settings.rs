@@ -190,8 +190,20 @@ fn path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        .or_else(fallback_config_base)?;
     Some(base.join("tsun").join("settings.json"))
+}
+
+/// Without `XDG_CONFIG_HOME`: `~/.config`. The unit tests get a scratch directory instead, so a
+/// test that navigates (which remembers the route) can never rewrite the developer's settings.
+#[cfg(not(test))]
+fn fallback_config_base() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+}
+
+#[cfg(test)]
+fn fallback_config_base() -> Option<PathBuf> {
+    Some(std::env::temp_dir().join("tsun-unit-test-config"))
 }
 
 /// `XDG_CONFIG_HOME` is process-wide, so tests that *write* settings (through

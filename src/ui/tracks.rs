@@ -375,6 +375,20 @@ pub(crate) fn blocks_page(key: &str) -> Page {
     Page::new(key, Body::Blocks, 0, 0.0)
 }
 
+/// A hash of every carousel's paging offset and of the cards across: part of a page's row
+/// version, because a carousel is a block inside a cached row and must be rebuilt when it pages.
+/// The offsets are summed, so the order of the map does not matter.
+fn carousel_stamp(s: &Ui) -> u64 {
+    use std::hash::Hasher;
+    let offsets = s.carousel_offsets.iter().fold(0u64, |sum, (key, offset)| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        offset.hash(&mut hasher);
+        sum.wrapping_add(hasher.finish())
+    });
+    version((offsets, s.columns.get()))
+}
+
 impl Page {
     fn new(key: &str, body: Body, generation: u64, estimate: f32) -> Self {
         Page {
@@ -427,9 +441,10 @@ impl Page {
         self
     }
 
-    /// The page: a scroll viewport holding the rows list alone. `_s` is the window's state,
-    /// which every caller has to hand; the rows themselves are built by rune's own call.
-    pub(crate) fn render(&self, _s: &Ui, p: Palette) -> El {
+    /// The page: a scroll viewport holding the rows list alone. `s` is the window's state; the
+    /// rows themselves are built by rune's own call, but the carousels' paging offsets are part
+    /// of the row version, so paging a carousel rebuilds the block that holds it.
+    pub(crate) fn render(&self, s: &Ui, p: Palette) -> El {
         let plan = Rc::new(Plan {
             key: self.key.clone(),
             leading: self.leading.clone(),
@@ -456,6 +471,7 @@ impl Page {
             plan.trailing.len(),
             columns,
             self.covers,
+            carousel_stamp(s),
         ));
         let key_plan = plan.clone();
         let build_plan = plan.clone();
@@ -574,6 +590,11 @@ impl Plan {
                     let item = index * per_row + slot;
                     if item < *len {
                         line = line.child(cell(s, p, item));
+                    } else {
+                        // An empty slot in the last row still holds its share of the width, so a
+                        // card that grows (a mix or a track card, unlike the fixed-width album,
+                        // artist, playlist and video cards) keeps the size it has in a full row.
+                        line = line.child(el().grow(1.0).min_w(0.0));
                     }
                 }
                 line

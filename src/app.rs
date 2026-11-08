@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
@@ -26,6 +27,7 @@ use crate::tidal::{
     Album, AlbumExtras, Artist, ArtistPage, Credit, FavKind, FavoriteIds, HomeSection, Library,
     LyricsData, Mix, Playlist, Profile, Quality, SearchAll, Section, Track, Video, VideoStream,
 };
+use crate::ui::cards::ViewAll;
 use crate::ui::context_menu::MenuState;
 use crate::ui::dialogs::{AlbumReviewDialog, Dialog, TrackInfo};
 use crate::ui::tracks::{Derived, DerivedLibrary, DerivedTracks, Tracks};
@@ -217,6 +219,8 @@ pub(crate) enum Page {
     Local,
     LocalAlbum,
     LocalArtist,
+    /// One carousel's whole list, opened by its header's "View all" button.
+    ViewAll,
     Settings,
 }
 
@@ -500,6 +504,12 @@ pub(crate) struct Ui {
     pub(crate) home_tab: HomeTab,
     /// Paging offsets of the card carousels, keyed by their element key.
     pub(crate) carousel_offsets: HashMap<String, usize>,
+    /// One carousel's whole list per "View all" page, keyed by the snapshot's own id. Kept so the
+    /// Back and Forward buttons can return to a page after the user has left it.
+    pub(crate) view_all: HashMap<u64, Rc<ViewAll>>,
+    /// Bumped whenever a "View all" page is shown, so the page it mounts is a fresh viewport
+    /// (keyed by the visit) and starts at the top every time it is opened.
+    pub(crate) view_all_visit: u64,
     /// The current track's lyrics: `(track id, lyrics)`, where a `None` payload means TIDAL
     /// has none for the track.
     pub(crate) lyrics: Option<(u64, Option<LyricsData>)>,
@@ -784,6 +794,8 @@ pub(crate) fn init() -> Ui {
         home_sections: Vec::new(),
         home_tab: HomeTab::ForYou,
         carousel_offsets: HashMap::new(),
+        view_all: HashMap::new(),
+        view_all_visit: 0,
         lyrics: None,
         lyrics_state: SearchState::Idle,
         lyrics_line: None,
@@ -1407,6 +1419,7 @@ impl Ui {
                     self.new_releases.clear();
                     self.home_sections.clear();
                     self.carousel_offsets.clear();
+                    self.view_all.clear();
                     self.clear_lyrics();
                     self.history.reset(Route::Home);
                 }
@@ -1995,6 +2008,15 @@ impl Ui {
         }));
     }
 
+    /// Opens one carousel's whole list on its own page, as the carousel headers' "View all"
+    /// button does. The snapshot is filed under its own id, so the Back and Forward buttons can
+    /// return to the page after the user has left it.
+    pub(crate) fn open_view_all(&mut self, all: Rc<ViewAll>) {
+        let id = all.id();
+        self.view_all.insert(id, all);
+        self.navigate(Route::ViewAll(id));
+    }
+
     /// Opens an album by id alone; the header fills in as the page loads.
     pub(crate) fn open_album(&mut self, id: u64) {
         self.navigate(Route::Album(id));
@@ -2321,6 +2343,8 @@ impl Ui {
             Page::Local | Page::LocalAlbum | Page::LocalArtist => {
                 self.start_local_scan();
             }
+            // A "View all" page holds a frozen snapshot: there is nothing to re-fetch.
+            Page::ViewAll => {}
             Page::Settings => {}
         }
     }
@@ -2369,6 +2393,9 @@ impl Ui {
             Route::Local => {}
             Route::LocalAlbum(key) => self.local_album = Some(key),
             Route::LocalArtist(name) => self.local_artist = Some(name),
+            // The snapshot is already in the map: the page reads it from the route's id. The
+            // visit counter makes the page it mounts start at the top every time it is opened.
+            Route::ViewAll(_) => self.view_all_visit = self.view_all_visit.wrapping_add(1),
         }
     }
 

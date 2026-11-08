@@ -22,6 +22,9 @@ pub(crate) enum Route {
     Local,
     LocalAlbum(String),
     LocalArtist(String),
+    /// One carousel's whole list, opened by its "View all" button. The id names the snapshot the
+    /// page holds in `Ui::view_all`.
+    ViewAll(u64),
 }
 
 impl Route {
@@ -41,6 +44,7 @@ impl Route {
             Route::Local => "local".to_owned(),
             Route::LocalAlbum(key) => format!("localalbum:{key}"),
             Route::LocalArtist(name) => format!("localartist:{name}"),
+            Route::ViewAll(id) => format!("viewall:{id}"),
         }
     }
 
@@ -81,6 +85,7 @@ impl Route {
             Route::Local => Page::Local,
             Route::LocalAlbum(_) => Page::LocalAlbum,
             Route::LocalArtist(_) => Page::LocalArtist,
+            Route::ViewAll(_) => Page::ViewAll,
         }
     }
 }
@@ -253,5 +258,16 @@ mod tests {
         assert!(matches!(Route::Collection.page(), Page::Collection));
         assert!(matches!(Route::Search.page(), Page::Search));
         assert!(matches!(Route::Home.page(), Page::Home));
+        assert!(matches!(Route::ViewAll(9).page(), Page::ViewAll));
+    }
+
+    /// A "View all" page holds a snapshot only this run has, so its route persists (for the
+    /// settings file's own record) but is never restored: a restart opens Home instead of an
+    /// empty page.
+    #[test]
+    fn a_view_all_route_is_not_restored() {
+        let route = Route::ViewAll(9);
+        assert_eq!(route.persist(), "viewall:9");
+        assert_eq!(Route::restore(&route.persist()), None);
     }
 }

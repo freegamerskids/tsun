@@ -261,3 +261,223 @@ fn bio(s: &Ui, p: Palette) -> El {
         .child(text("About").font(H2).color(p.text))
         .child(text(bio.to_owned()).font(BODY).color(p.dim).wrap_anywhere())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{Login, Page, init};
+    use crate::history::Route;
+    use crate::tidal::{Album, ArtistPage, Video};
+
+    /// A scratch `XDG_CONFIG_HOME` for the tests that navigate: every route change persists the
+    /// settings file, which must never be the user's own. It also holds the environment lock, so
+    /// no other test reads the settings while this directory is named.
+    struct ConfigHome {
+        previous: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+        _turn: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ConfigHome {
+        fn new(name: &str) -> ConfigHome {
+            let turn = crate::settings::lock_config_env();
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("tsun-artist-{}-{name}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            // SAFETY: the lock is held for as long as the environment names this directory, and
+            // the value is restored on drop.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+            ConfigHome { previous, dir, _turn: turn }
+        }
+    }
+
+    impl Drop for ConfigHome {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The first element (in tree order) whose key starts with `prefix`: the leftmost card of a
+    /// carousel row, since the row's children are its cards.
+    fn first_key(rt: &rune::Runtime<Ui>, prefix: &str) -> Option<String> {
+        rt.elements()
+            .into_iter()
+            .find(|element| !element.exiting && element.key.as_deref().is_some_and(|key| key.starts_with(prefix)))
+            .and_then(|element| element.key)
+    }
+
+    fn album(index: usize) -> Album {
+        Album {
+            id: 100 + index as u64,
+            title: format!("Album {index}"),
+            artist: "Artist".to_owned(),
+            ..Album::default()
+        }
+    }
+
+    fn video(index: usize) -> Video {
+        Video {
+            id: 900 + index as u64,
+            title: format!("Video {index}"),
+            artist: "Artist".to_owned(),
+            ..Video::default()
+        }
+    }
+
+    /// The artist page as the window draws it: `albums` albums in its first carousel, `videos`
+    /// videos in the second, and no top tracks — so both sections are the first thing below the
+    /// header and are mounted. The route is in the history, so Back has the artist page to
+    /// return to. Callers hold a [`ConfigHome`], since navigating persists the settings.
+    fn artist_page(albums: usize, videos: usize) -> rune::Runtime<Ui> {
+        let mut s = init();
+        s.login = Login::LoggedIn;
+        // Reached the way the app reaches it (`navigate` would reload the page's data).
+        s.history.push(Route::Artist(5));
+        s.page = Page::Artist;
+        s.artist_state = SearchState::Done;
+        let artist = Artist { id: 5, name: "Artist".to_owned(), picture: None };
+        s.artist = Some(artist.clone());
+        s.artist_page = Some(ArtistPage {
+            artist,
+            bio: None,
+            top_tracks: Vec::new(),
+            top_tracks_total: None,
+            albums: (0..albums).map(album).collect(),
+            singles: Vec::new(),
+            appears_on: Vec::new(),
+            videos: (0..videos).map(video).collect(),
+            similar: Vec::new(),
+        });
+        let mut rt = rune::Runtime::new(
+            s,
+            crate::ui::view,
+            (1280.0, 800.0),
+            rune::Env::new(true, 1.0),
+        );
+        for _ in 0..4 {
+            rt.frame(0.0);
+        }
+        rt
+    }
+
+    /// Presses the element keyed `key`, then lets the frame land.
+    fn press(rt: &mut rune::Runtime<Ui>, key: &str) {
+        let (x, y) = rt.find(key).unwrap_or_else(|| panic!("no element keyed {key}"));
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..3 {
+            rt.frame(1.0 / 120.0);
+        }
+    }
+
+    /// The carousel chevrons page the cards: the row a carousel sits in is cached by the page's
+    /// version, which carries `carousel_stamp`, so an offset change must rebuild it.
+    #[test]
+    fn the_album_carousel_chevrons_page_the_cards() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _config = ConfigHome::new("albums-page");
+        let mut rt = artist_page(30, 0);
+        let before = first_key(&rt, "album-").expect("the first carousel draws its cards");
+        press(&mut rt, "artist-albums-next");
+        assert!(
+            rt.state.carousel_offsets.get("artist-albums").copied().unwrap_or(0) > 0,
+            "the chevron paged the carousel"
+        );
+        assert_ne!(
+            first_key(&rt, "album-"),
+            Some(before.clone()),
+            "the visible cards changed with the offset"
+        );
+        press(&mut rt, "artist-albums-prev");
+        assert_eq!(first_key(&rt, "album-"), Some(before), "paging back shows the first page again");
+    }
+
+    /// The same for the video carousel, which pages the same frame.
+    #[test]
+    fn the_video_carousel_chevrons_page_the_cards() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _config = ConfigHome::new("videos-page");
+        let mut rt = artist_page(0, 12);
+        for _ in 0..6 {
+            rt.wheel(600.0, 400.0, -200.0);
+            rt.frame(1.0 / 120.0);
+        }
+        let before = first_key(&rt, "video-thumb-").expect("the carousel draws its videos");
+        press(&mut rt, "artist-videos-next");
+        assert_ne!(
+            first_key(&rt, "video-thumb-"),
+            Some(before.clone()),
+            "the visible videos changed with the offset"
+        );
+        press(&mut rt, "artist-videos-prev");
+        assert_eq!(first_key(&rt, "video-thumb-"), Some(before), "paging back shows the first page");
+    }
+
+    /// "View all" opens the carousel's whole list on its own page: a virtualized grid of the same
+    /// cards under the carousel's title, with no chevrons, and Back returns to the artist page.
+    #[test]
+    fn view_all_opens_the_whole_carousel_as_a_page() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _config = ConfigHome::new("view-all");
+        let mut rt = artist_page(300, 0);
+        assert!(rt.find("artist-albums-all").is_some(), "a carousel longer than a page offers View all");
+        press(&mut rt, "artist-albums-all");
+        assert_eq!(rt.state.page, Page::ViewAll, "the button opens its own page");
+        assert!(rt.find("album-100").is_some(), "the first album's card is up");
+        assert!(
+            rt.find("album-399").is_none(),
+            "the last one is not built before it is scrolled to"
+        );
+        assert!(rt.find("artist-albums-next").is_none(), "the page holds no carousel chevrons");
+        // Scrolling reaches the last album of all three hundred: the grid is virtualized, not
+        // capped at what a carousel page holds.
+        for _ in 0..80 {
+            rt.wheel(600.0, 400.0, -900.0);
+            rt.frame(1.0 / 120.0);
+        }
+        assert!(rt.find("album-399").is_some(), "the last album is reachable");
+        // Back returns to the artist page (which reloads its data, as the app's Back does)...
+        rt.update(|s, _| s.go_back());
+        for _ in 0..3 {
+            rt.frame(1.0 / 120.0);
+        }
+        assert_eq!(rt.state.page, Page::Artist, "Back returns to the artist page");
+        assert!(
+            rt.elements().into_iter().any(|element| !element.exiting && element.text.as_deref() == Some("Artist")),
+            "the artist's own header is up"
+        );
+        // ...and Forward finds the snapshot again: the page is kept in the map for exactly this,
+        // and opens at the top.
+        rt.update(|s, _| s.go_forward());
+        for _ in 0..3 {
+            rt.frame(1.0 / 120.0);
+        }
+        assert_eq!(rt.state.page, Page::ViewAll, "Forward returns to the View all page");
+        assert!(
+            rt.find("album-100").is_some(),
+            "with the snapshot back, opened at the top again"
+        );
+    }
+
+    /// A carousel whose whole list already fits on one page has nothing more to show, so it
+    /// draws no "View all" button.
+    #[test]
+    fn a_carousel_that_fits_on_one_page_has_no_view_all() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _config = ConfigHome::new("fits");
+        let rt = artist_page(2, 0);
+        assert!(rt.find("album-100").is_some(), "the albums are drawn");
+        assert!(rt.find("artist-albums-all").is_none(), "with nothing more to show");
+    }
+}

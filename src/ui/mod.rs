@@ -5,6 +5,7 @@
 use rune::{Align, Cx, El, Side, col, el, row, text};
 
 use crate::app::{Login, Notice, Page, Ui};
+use crate::history::Route;
 use crate::theme::{BODY, Palette, palette};
 use crate::widgets::secondary_button;
 
@@ -241,6 +242,15 @@ pub(crate) fn content(s: &Ui, p: Palette) -> El {
             Page::Local => local::local_content(s, p),
             Page::LocalAlbum => local::local_album_content(s, p),
             Page::LocalArtist => local::local_artist_content(s, p),
+            // The page reads its snapshot from the route it is showing: an id the map still holds
+            // (it is cleared only with the session, so Back works), else nothing.
+            Page::ViewAll => match s.history.current() {
+                Some(Route::ViewAll(id)) => match s.view_all.get(id) {
+                    Some(all) => cards::view_all_content(s, p, all),
+                    None => el(),
+                },
+                _ => el(),
+            },
             Page::Settings => settings::settings_content(s, p),
         }
     } else {

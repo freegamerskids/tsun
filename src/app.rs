@@ -2984,6 +2984,13 @@ impl Ui {
         self.now_playing.as_ref().map(|playing| playing.elapsed).unwrap_or(0)
     }
 
+    /// Whether the track the player bar or the Now Playing view is showing is one TIDAL flags
+    /// explicit. `NowPlaying` carries the display fields only, and the queue holds the track it
+    /// was taken from, so the flag is read there (and only while that track is the current one).
+    pub(crate) fn shown_is_explicit(&self, id: u64) -> bool {
+        self.queue.current().is_some_and(|track| track.id == id && track.explicit)
+    }
+
     /// Toggles the right-hand queue panel. On a narrow window the lyrics panel makes way for
     /// it: the sidebar plus both panels would leave the main area no width at all.
     pub(crate) fn toggle_queue(&mut self) {

@@ -31,7 +31,7 @@ use rune::{Color, El, GrowthSpec, ScrollSpec, col, el, icon, row, text};
 use crate::app::Ui;
 use crate::theme::{CAPS, ICON_PAUSE, ICON_PLAY, SMALL, TRACK, Palette};
 use crate::tidal::{Album, Artist, FavKind, Track};
-use crate::ui::cards::{columns, cover_tile, heart_button, link_text, quality_badge};
+use crate::ui::cards::{columns, cover_tile, heart_button, link_text, quality_badge, title_with_badge};
 use crate::ui::context_menu::{MenuState, TrackMenu, menu_button};
 use crate::util::format_duration;
 
@@ -733,7 +733,7 @@ fn track_row(s: &Ui, p: Palette, index: usize, rows: &Rc<[Track]>, covers: bool)
     line
         .child(
             col().grow(4.0).min_w(0.0).gap(3.0)
-                .child(text(track.title.clone()).font(TRACK).color(p.text).truncate())
+                .child(title_with_badge(p, text(track.title.clone()).font(TRACK).color(p.text).truncate(), track.explicit))
                 .child(body),
         )
         .child(album_cell)
@@ -1161,6 +1161,65 @@ mod tests {
                  scroll mean {scroll_mean:?} max {scroll_max:?}"
             );
         }
+    }
+
+    /// An explicit track's row carries the `E` badge after its title and a clean one does not; a
+    /// very long title is truncated instead of pushing the badge out of the row.
+    #[test]
+    fn explicit_rows_show_the_badge_and_long_titles_do_not_push_it_out() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _env = crate::settings::lock_config_env();
+        let long = "A very long explicit track title that keeps going and going. ".repeat(4);
+        let mut s = init();
+        s.results.set(vec![
+            Track {
+                id: 1,
+                title: long.clone(),
+                artist: "Artist".to_owned(),
+                explicit: true,
+                ..Track::default()
+            },
+            Track {
+                id: 2,
+                title: "Clean".to_owned(),
+                artist: "Artist".to_owned(),
+                ..Track::default()
+            },
+        ]);
+        let mut rt = rune::Runtime::new(s, rows_view, (900.0, 300.0), rune::Env::new(true, 1.0));
+        for _ in 0..4 {
+            rt.frame(0.0);
+        }
+        let live = |rt: &rune::Runtime<Ui>| {
+            rt.elements().into_iter().filter(|element| !element.exiting).collect::<Vec<_>>()
+        };
+        let elements = live(&rt);
+        let row = elements
+            .iter()
+            .find(|element| element.key.as_deref() == Some("track-1"))
+            .expect("the explicit row is mounted");
+        let badges: Vec<_> = elements
+            .iter()
+            .filter(|element| element.key.as_deref() == Some("explicit-badge"))
+            .collect();
+        assert_eq!(badges.len(), 1, "only the explicit row carries a badge");
+        let badge = badges[0];
+        assert_eq!((badge.rect[2], badge.rect[3]), (16.0, 16.0), "the badge is the size it asks for");
+        assert_eq!(badge.label.as_deref(), Some("Explicit"), "and says what it means");
+        assert!(
+            badge.rect[0] >= row.rect[0] && badge.rect[0] + badge.rect[2] <= row.rect[0] + row.rect[2],
+            "the badge stays inside the row: badge {:?} of row {:?}",
+            badge.rect,
+            row.rect
+        );
+        // The title gave way: the whole string is 230 characters, and it is drawn in a fraction
+        // of the row's width so the badge and the columns after it keep their places.
+        let title = elements
+            .iter()
+            .find(|element| element.text.as_deref() == Some(long.as_str()))
+            .expect("the title is drawn");
+        assert!(title.rect[2] < row.rect[2] / 2.0, "the title is truncated: {:?}", title.rect);
+        assert!(title.rect[2] > 0.0, "but still has room of its own");
     }
 
     /// `frames` timed commits, each asking for a commit first (as a real change does).

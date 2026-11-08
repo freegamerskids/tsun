@@ -73,6 +73,42 @@ pub(crate) fn quality_badge(p: Palette, label: &str) -> El {
         .child(text(label).font(CAPS).color(p.dim))
 }
 
+/// The side of the explicit marker, in points: the official client's small square.
+const EXPLICIT: f32 = 16.0;
+
+/// The explicit marker the official client draws: a small dim rounded square with an `E`, placed
+/// after the title of an explicit track, album or video. Its size is fixed, so it never shrinks
+/// away — a long title truncates first.
+pub(crate) fn explicit_badge(p: Palette) -> El {
+    el()
+        .key("explicit-badge")
+        .role("image")
+        .label("Explicit")
+        .size(EXPLICIT, EXPLICIT)
+        .center()
+        .radius(3.0)
+        .fill(p.faint)
+        .child(text("E").font(TextStyle::new(10.5, 700.0)).color(p.bg))
+}
+
+/// A title with the explicit badge after it when `explicit`, for every surface that shows a
+/// track's, album's or video's name. The badge is fixed-size and cannot shrink, and the title
+/// does (it is truncated), so a long name is cut rather than pushing the badge out of the row.
+/// Pass a title that hugs its text (no `w_full` of its own): the badge then sits right after it,
+/// as the official client draws it, however much room the surface has left.
+pub(crate) fn title_with_badge(p: Palette, title: El, explicit: bool) -> El {
+    if !explicit {
+        return title;
+    }
+    row()
+        .w_full()
+        .min_w(0.0)
+        .gap(6.0)
+        .center_y()
+        .child(title.shrink().min_w(0.0))
+        .child(explicit_badge(p))
+}
+
 /// The heart toggle: filled and bright when `kind`/`id` is a favourite, an
 /// outline otherwise. Pressing it flips the favourite optimistically.
 pub(crate) fn heart_button(s: &Ui, p: Palette, kind: FavKind, id: &str, size: f32) -> El {
@@ -121,7 +157,9 @@ pub(crate) fn album_card(s: &Ui, p: Palette, album: &Album) -> El {
         .w(168.0).gap(8.0).focusable(true)
         .on_press(move |s: &mut Ui| s.open_album_with(open.clone()))
         .child(cover_tile_large(s, p, album.cover.as_deref(), 168.0))
-        .child(text(album.title.clone()).font(TRACK).color(p.text).w_full().truncate())
+        // No `w_full`: the title hugs its text so the badge sits right after it, and shrinks
+        // inside the card when the name is long.
+        .child(title_with_badge(p, text(album.title.clone()).font(TRACK).color(p.text).truncate(), album.explicit))
         .child(text(subtitle).font(SMALL).color(p.dim).w_full().truncate())
 }
 
@@ -440,6 +478,76 @@ pub(crate) fn track_card(s: &Ui, p: Palette, track: &Track, play: impl Fn(&mut U
         .focusable(true).grow(1.0).min_w(0.0).gap(8.0)
         .on_press(move |s: &mut Ui| pressed(s))
         .child(cover_art(s, p, track.cover.as_deref(), None))
-        .child(text(track.title.clone()).font(TRACK).color(p.text).truncate())
+        .child(title_with_badge(p, text(track.title.clone()).font(TRACK).color(p.text).truncate(), track.explicit))
         .child(text(track.artist.clone()).font(SMALL).color(p.dim).truncate())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::init;
+    use crate::theme::palette;
+
+    /// Two album cards side by side: the first explicit, the second not.
+    fn cards_view(s: &Ui, _: &mut rune::Cx<Ui>) -> El {
+        let p = palette();
+        let album = |id: u64, title: &str, explicit: bool| Album {
+            id,
+            title: title.to_owned(),
+            artist: "Artist".to_owned(),
+            explicit,
+            ..Album::default()
+        };
+        col()
+            .w_full()
+            .h_full()
+            .gap(16.0)
+            .child(album_card(s, p, &album(1, "Explicit album", true)))
+            .child(album_card(s, p, &album(2, "Clean album", false)))
+    }
+
+    /// An album card puts the marker after its title, and only when TIDAL flags the album; a
+    /// long title is truncated rather than pushing the badge off the card.
+    #[test]
+    fn explicit_album_cards_show_the_badge() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _env = crate::settings::lock_config_env();
+        let s = init();
+        s.columns.set(4);
+        let mut rt = rune::Runtime::new(s, cards_view, (900.0, 600.0), rune::Env::new(true, 1.0));
+        for _ in 0..4 {
+            rt.frame(0.0);
+        }
+        let elements: Vec<_> =
+            rt.elements().into_iter().filter(|element| !element.exiting).collect();
+        let badges: Vec<_> = elements
+            .iter()
+            .filter(|element| element.key.as_deref() == Some("explicit-badge"))
+            .collect();
+        assert_eq!(badges.len(), 1, "only the explicit album's card carries a badge");
+        let badge = badges[0];
+        let card = elements
+            .iter()
+            .find(|element| element.key.as_deref() == Some("album-1"))
+            .expect("the explicit album's card is drawn");
+        assert_eq!((badge.rect[2], badge.rect[3]), (16.0, 16.0), "the badge is its own size");
+        assert!(
+            badge.rect[0] >= card.rect[0] && badge.rect[0] + badge.rect[2] <= card.rect[0] + card.rect[2],
+            "and sits inside the card: badge {:?} of card {:?}",
+            badge.rect,
+            card.rect
+        );
+        // It hugs the title, as the official client draws it: the gap after the text is the
+        // layout gap, not the rest of the card.
+        let title = elements
+            .iter()
+            .find(|element| element.text.as_deref() == Some("Explicit album"))
+            .expect("the card's title is drawn");
+        assert!(
+            badge.rect[0] - (title.rect[0] + title.rect[2]) < 8.0,
+            "the badge follows the title at the layout gap: title {:?}, badge {:?}",
+            title.rect,
+            badge.rect
+        );
+    }
 }

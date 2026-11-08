@@ -14,7 +14,7 @@ use rune::{El, Tx, col, el, row, text};
 use crate::app::{SearchState, Ui};
 use crate::theme::{BODY, CAPS, H2, HERO, Palette, SMALL, SUBTITLE};
 use crate::tidal::{Album, FavKind};
-use crate::ui::cards::{album_card, cover_tile, heart_button, link_text, quality_badge};
+use crate::ui::cards::{album_card, cover_tile, heart_button, link_text, quality_badge, title_with_badge};
 use crate::ui::context_menu::{MenuState, header_menu_button};
 use crate::ui::tracks::{TRACK_H, section, tracks_page};
 use crate::util::{quality_badge as badge_label, total_duration};
@@ -130,7 +130,7 @@ fn header(s: &Ui, p: Palette) -> El {
         .min_w(0.0)
         .gap(12.0)
         .child(text("ALBUM").font(CAPS).color(p.dim))
-        .child(text(album.title.clone()).font(HERO).color(p.text).truncate())
+        .child(title_with_badge(p, text(album.title.clone()).font(HERO).color(p.text).truncate(), album.explicit))
         .child(artist(album, p))
         .child(meta(s, album, p))
         .child(review(s, p))

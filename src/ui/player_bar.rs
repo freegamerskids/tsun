@@ -64,10 +64,12 @@ fn now_playing_area(s: &Ui, p: Palette, playing: Option<&crate::app::NowPlaying>
     }
 
     let title = playing.map(|track| track.title.clone()).unwrap_or_else(|| "Nothing playing".to_owned());
+    let explicit = playing.is_some_and(|track| s.shown_is_explicit(track.id));
     let mut title_el = text(title)
         .font(TRACK)
         .color(if playing.is_some() { p.text } else { p.dim })
         .truncate();
+    title_el = crate::ui::cards::title_with_badge(p, title_el, explicit);
     if let Some(album_id) = playing.and_then(|track| track.album_id) {
         // `w_full`, not `grow`: this sits in a column, where growing stretches it vertically
         // and pushes the block off-centre against the cover.
@@ -597,6 +599,32 @@ mod tests {
             rt.elements().into_iter().filter_map(|element| element.key).collect();
         assert!(!keys.iter().any(|key| key == "player-heart"), "{keys:?}");
         assert!(keys.iter().any(|key| key == "quality-pill"), "the quality pill still shows the file format");
+    }
+
+    /// The bar marks the track it is showing when TIDAL flags it explicit, and leaves a clean
+    /// one unmarked.
+    #[test]
+    fn the_bar_marks_an_explicit_track() {
+        // `init` reads the settings file, whose directory the environment names.
+        let _env = crate::settings::lock_config_env();
+        let badge = |explicit: bool| {
+            let mut rt = runtime();
+            rt.update(|s, _| {
+                let track = crate::tidal::Track {
+                    id: 7,
+                    title: "Track".to_owned(),
+                    explicit,
+                    ..crate::tidal::Track::default()
+                };
+                s.queue.set(vec![track], 0);
+            });
+            for _ in 0..2 {
+                rt.frame(1.0 / 120.0);
+            }
+            rt.elements().into_iter().any(|element| element.key.as_deref() == Some("explicit-badge"))
+        };
+        assert!(badge(true), "an explicit track is marked in the bar");
+        assert!(!badge(false), "a clean track is not");
     }
 
     /// The volume dot marks the value: at the left end of the track for silence, half way

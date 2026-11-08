@@ -119,6 +119,8 @@ fn details_block(s: &Ui, p: Palette) -> El {
     let album = playing.map(|track| track.album.clone()).unwrap_or_default();
 
     let mut title_el = text(title).font(H1).color(p.text).truncate();
+    let explicit = playing.is_some_and(|track| s.shown_is_explicit(track.id));
+    title_el = crate::ui::cards::title_with_badge(p, title_el, explicit);
     if let Some(album_id) = playing.and_then(|track| track.album_id) {
         title_el = el().role("button").label("Open album").focusable(true)
             .on_press(move |s: &mut Ui| s.open_album(album_id)).child(title_el);

@@ -6,7 +6,7 @@ use rune::{Color, El, TextStyle, Tx, col, el, row, spacer, text};
 use crate::app::{HomeTab, SearchState, Ui};
 use crate::theme::{BODY, H1, H2, SMALL, TRACK, Palette};
 use crate::tidal::{FavKind, Track};
-use crate::ui::cards::{heart_button, track_card};
+use crate::ui::cards::{heart_button, title_with_badge, track_card};
 use crate::ui::context_menu::{MenuState, TrackMenu, menu_button};
 use crate::ui::mixes::mix_gallery;
 use crate::ui::sections::{catalogue_sections_view, sections_view};
@@ -226,7 +226,7 @@ fn compact_track(
         })
         .child(cover_art(s, p, track.cover.as_deref(), Some(48.0)))
         .child(col().grow(1.0).min_w(0.0).gap(4.0)
-            .child(text(track.title.clone()).font(TRACK).color(p.text).truncate())
+            .child(title_with_badge(p, text(track.title.clone()).font(TRACK).color(p.text).truncate(), track.explicit))
             .child(text(track.artist.clone()).font(SMALL).color(p.dim).truncate()))
         .child(favourite)
         .child(menu_button(p, &menu_key, "Track options", menu))

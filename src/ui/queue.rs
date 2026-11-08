@@ -10,6 +10,7 @@ use rune::{Color, El, col, el, icon, row, text};
 
 use crate::app::Ui;
 use crate::theme::{BODY, H2, ICON_CLOSE, ICON_QUEUE, SMALL, TRACK, Palette};
+use crate::ui::cards::title_with_badge;
 use crate::ui::context_menu::{MenuState, TrackMenu, menu_button};
 use crate::ui::tracks::{section, track_rows_page, version};
 use crate::widgets::cover_art;
@@ -130,7 +131,11 @@ fn queue_row(s: &Ui, p: Palette, track: &crate::tidal::Track, current: bool) -> 
             s.open_menu(MenuState::track(anchor.clone(), for_press.clone()).at(press))
         });
     let mut text_col = col().grow(1.0).min_w(0.0).gap(2.0)
-        .child(text(track.title.clone()).font(TRACK).color(if current { p.accent } else { p.text }).truncate())
+        .child(title_with_badge(
+            p,
+            text(track.title.clone()).font(TRACK).color(if current { p.accent } else { p.text }).truncate(),
+            track.explicit,
+        ))
         .child(text(track.artist.clone()).font(SMALL).color(p.dim).truncate());
     if current {
         text_col = text_col.child(text(s.now_playing.as_ref().and_then(|playing| playing.quality.as_deref()).unwrap_or("Playing")).font(SMALL).color(p.faint).truncate());

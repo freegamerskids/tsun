@@ -9,7 +9,7 @@ use crate::theme::{BODY, BUTTON, CAPS, H1, H2, ICON_SEARCH, SMALL, TRACK, Palett
 use crate::tidal::{SearchAll, TopHit, Track};
 use crate::ui::cards::{
     album_card, album_carousel, artist_card, artist_carousel, playlist_card, playlist_carousel,
-    round_art,
+    round_art, title_with_badge,
 };
 use crate::ui::tracks::{ARTIST_H, ALBUM_H, IndexList, PLAYLIST_H, TRACK_H, VIDEO_H, grid_page, tracks_page};
 use crate::ui::video::{video_carousel, video_card};
@@ -264,7 +264,7 @@ fn top_hit(s: &Ui, p: Palette, hit: &TopHit) -> El {
                 .on_press(move |s: &mut Ui| s.open_album(id))
                 .child(cover_art(s, p, album.cover.as_deref(), Some(228.0)))
                 .child(section_label("ALBUM", p))
-                .child(text(album.title.clone()).font(H2).color(p.text).truncate())
+                .child(title_with_badge(p, text(album.title.clone()).font(H2).color(p.text).truncate(), album.explicit))
                 .child(text(album.artist.clone()).font(BODY).color(p.dim).truncate())
         }
         TopHit::Artist(artist) => {
@@ -314,7 +314,7 @@ fn top_hit(s: &Ui, p: Palette, hit: &TopHit) -> El {
                 })
                 .child(cover_art(s, p, track.cover.as_deref(), Some(228.0)))
                 .child(section_label("TRACK", p))
-                .child(text(track.title.clone()).font(H2).color(p.text).truncate())
+                .child(title_with_badge(p, text(track.title.clone()).font(H2).color(p.text).truncate(), track.explicit))
                 .child(text(track.artist.clone()).font(BODY).color(p.dim).truncate())
         }
     }
@@ -358,7 +358,7 @@ fn short_row(s: &Ui, p: Palette, track: &Track, index: usize) -> El {
         .child(cover_art(s, p, track.cover.as_deref(), Some(48.0)))
         .child(
             col().grow(1.0).min_w(0.0).gap(3.0)
-                .child(text(track.title.clone()).font(TRACK).color(p.text).truncate())
+                .child(title_with_badge(p, text(track.title.clone()).font(TRACK).color(p.text).truncate(), track.explicit))
                 .child(text(track.artist.clone()).font(SMALL).color(p.dim).truncate()),
         )
         .child(play_button(s, p, id, &track.title, current, pending))

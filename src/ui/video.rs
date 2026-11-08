@@ -11,6 +11,7 @@
 use rune::{Color, Drag, El, Phase, SurfaceFit, Tx, col, el, icon, row, text};
 
 use crate::app::Ui;
+use crate::ui::cards::title_with_badge;
 use crate::theme::{
     BODY, BUTTON, CAPS, H1, ICON_CLOSE, ICON_HEART, ICON_HEART_FILLED, ICON_PAUSE,
     ICON_PLAY, ICON_VOLUME_HIGH, ICON_VOLUME_LOW, ICON_VOLUME_MUTE, Palette, SMALL, SUBTITLE, TRACK,
@@ -64,7 +65,7 @@ pub(crate) fn video_card(s: &Ui, p: Palette, video: &Video) -> El {
         .focusable(true)
         .on_press(move |s: &mut Ui| s.play_video(play.clone()))
         .child(thumb)
-        .child(text(video.title.clone()).font(TRACK).color(p.text).w_full().truncate())
+        .child(title_with_badge(p, text(video.title.clone()).font(TRACK).color(p.text).truncate(), video.explicit))
         .child(text(subtitle).font(SMALL).color(p.dim).w_full().truncate())
 }
 
@@ -174,7 +175,8 @@ fn details(s: &Ui, p: Palette, meta: &Video) -> El {
         .unwrap_or(false);
 
     let mut title_row = row().w_full().center_y().gap(10.0);
-    title_row = title_row.child(text(meta.title.clone()).font(H1).color(p.text).truncate().grow(1.0).min_w(0.0));
+    let title = text(meta.title.clone()).font(H1).color(p.text).truncate().grow(1.0).min_w(0.0);
+    title_row = title_row.child(title_with_badge(p, title, meta.explicit));
     let id = meta.id.to_string();
     let favorite = s.is_favorite(FavKind::Video, &id);
     title_row = title_row.child(

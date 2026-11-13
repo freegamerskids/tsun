@@ -3983,6 +3983,7 @@ dependencies = [
  "sha2",
  "symphonia",
  "ureq",
+ "windows-sys 0.61.2",
  "zbus 5.19.0",
 ]
 

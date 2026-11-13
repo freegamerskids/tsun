@@ -2112,7 +2112,11 @@ impl AudioOutput {
                     )
                 })?,
             None => host.default_output_device().ok_or_else(|| {
-                "no audio output device is available; check that PipeWire/PulseAudio (or ALSA) is running and a default sink exists".to_string()
+                if cfg!(target_os = "linux") {
+                    "no audio output device is available; check that PipeWire/PulseAudio (or ALSA) is running and a default sink exists".to_string()
+                } else {
+                    "no audio output device is available; check the system's sound settings".to_string()
+                }
             })?,
         };
         let label = device.name().unwrap_or_else(|_| "audio output".to_string());

@@ -4360,14 +4360,7 @@ fn parse_home_sections(page: &Value) -> Vec<HomeSection> {
 // Persistence
 
 fn session_file_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
-        })
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
-    Some(base.join("tsun").join("session.json"))
+    Some(crate::paths::config_dir()?.join("session.json"))
 }
 
 fn write_session_file(path: &Path, data: &PersistedSession) -> Result<(), String> {

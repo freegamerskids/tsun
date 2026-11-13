@@ -27,6 +27,7 @@ use crate::art::cover_art_url;
 /// for many covers — so each size is tried in turn and the first that responds is used.
 const OVERLAY_SIZES: [u32; 2] = [640, 320];
 /// The sizes tried for the notification icon; smaller keeps the cached file (and the bubble) tidy.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const NOTIFY_SIZES: [u32; 2] = [320, 160];
 /// Bounds one cover download so a stalled request cannot pin the worker.
 const TIMEOUT: Duration = Duration::from_secs(8);
@@ -221,7 +222,8 @@ pub(crate) fn srgb_to_linear(value: f32) -> f32 {
 ///
 /// Blocking (network + file I/O): call it from the notification thread, never the UI frame. Any
 /// malformed id, failed download or cache-write failure yields `None`, and the notification is
-/// posted without an icon.
+/// posted without an icon. Only the Linux notification backend calls it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn cover_file(id: &str) -> Option<PathBuf> {
     // A local track's artwork is already a JPEG thumbnail on disk; the notification uses it
     // directly instead of downloading anything.
@@ -248,13 +250,10 @@ pub(crate) fn cover_file(id: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-/// `$XDG_CACHE_HOME/tsun/covers/<uuid>.jpg`, or `~/.cache/tsun/covers/<uuid>.jpg`.
+/// `covers/<uuid>.jpg` in [`crate::paths::cache_dir`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn cache_path(id: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("tsun").join("covers").join(format!("{id}.jpg")))
+    Some(crate::paths::cache_dir()?.join("covers").join(format!("{id}.jpg")))
 }
 
 // ---------------------------------------------------------------------------------------------

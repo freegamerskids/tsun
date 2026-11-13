@@ -1245,6 +1245,7 @@ mod tests {
     /// Same opt-in as the test above (null ALSA device, `TSUN_AUDIO_TEST=1`). The Last.fm
     /// thresholds are turned down for it: a generated file is a second long and the null device
     /// plays it faster than real time, so the official rule could never be reached.
+    #[cfg(unix)]
     #[test]
     fn the_integrations_follow_a_worker_auto_advance_with_no_ui() {
         if std::env::var_os("TSUN_AUDIO_TEST").is_none() {

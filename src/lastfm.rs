@@ -17,8 +17,6 @@
 //! in `settings.json`. tsun ships no key of its own.
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -274,22 +272,14 @@ pub(crate) fn backoff_secs(failures: u32) -> f64 {
     (BASE_BACKOFF_SECS * (1u32 << shift) as f64).min(MAX_BACKOFF_SECS)
 }
 
-/// `$XDG_CONFIG_HOME/tsun/<name>`, or `~/.config/tsun/<name>`.
+/// `<name>` in [`crate::paths::config_dir`].
 fn path(name: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("tsun").join(name))
+    Some(crate::paths::config_dir()?.join(name))
 }
 
 /// Writes `bytes` to `path` with `0600` permissions, best-effort.
 fn write_private(path: &std::path::Path, bytes: &[u8]) {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
-    if let Ok(mut file) = options.open(path) {
-        let _ = file.write_all(bytes);
-    }
+    let _ = crate::paths::write_private(path, bytes);
 }
 
 // ---------------------------------------------------------------------------------------------

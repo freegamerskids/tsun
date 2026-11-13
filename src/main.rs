@@ -21,6 +21,7 @@ mod media_events;
 mod media_hub;
 mod mpris;
 mod notify;
+mod paths;
 mod playback;
 mod recent;
 mod settings;

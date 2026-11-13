@@ -11,8 +11,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -658,15 +656,12 @@ fn folder_image(path: &Path) -> Option<Vec<u8>> {
     None
 }
 
-/// `$XDG_CACHE_HOME/tsun/local-covers`, or `~/.cache/tsun/local-covers`; a temp directory when
-/// the environment names neither.
+/// `local-covers` in [`crate::paths::cache_dir`]; a temp directory when the environment names
+/// no cache home.
 pub(crate) fn cover_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("tsun").join("local-covers")
+    crate::paths::cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("tsun"))
+        .join("local-covers")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -762,16 +757,8 @@ impl CachedTrack {
     }
 }
 
-fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("tsun"))
-}
-
 fn index_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("local_index.json"))
+    Some(crate::paths::config_dir()?.join("local_index.json"))
 }
 
 fn load_cache() -> HashMap<String, CachedTrack> {
@@ -796,11 +783,7 @@ fn save_cache(entries: &HashMap<String, CachedTrack>) {
         entries: list.into_iter().cloned().collect(),
     };
     let Ok(text) = serde_json::to_vec(&file) else { return };
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
-    if let Ok(mut handle) = options.open(&path) {
-        let _ = handle.write_all(&text);
-    }
+    let _ = crate::paths::write_private(&path, &text);
 }
 
 /// Loads the cached index written by the last scan, without touching the filesystem beyond the
@@ -842,26 +825,42 @@ pub(crate) fn describe(path: &Path) -> Option<LocalTrack> {
     parse_file(path, mtime_of(&metadata), metadata.len(), &cover_dir())
 }
 
-/// Reveals `path` in the desktop's file manager (`org.freedesktop.FileManager1.ShowItems`),
-/// falling back to `xdg-open` on its parent folder. Runs on its own thread so a slow bus or
-/// launcher never stalls the frame.
+/// Reveals `path` in the desktop's file manager: Finder, Explorer, or
+/// `org.freedesktop.FileManager1.ShowItems` with `xdg-open` on the parent folder as the
+/// fallback. Runs on its own thread so a slow bus or launcher never stalls the frame.
 pub(crate) fn show_in_file_manager(path: PathBuf) {
     thread::Builder::new()
         .name("tsun-file-manager".to_owned())
         .spawn(move || {
-            if reveal_in_file_manager(&path).is_ok() {
-                return;
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+            // Explorer wants `/select,"<path>"` verbatim, not the whole argument quoted.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let mut select = std::ffi::OsString::from("/select,\"");
+                select.push(&path);
+                select.push("\"");
+                let _ = std::process::Command::new("explorer").raw_arg(select).spawn();
             }
-            let folder = if path.is_dir() {
-                path
-            } else {
-                path.parent().map(Path::to_path_buf).unwrap_or(path)
-            };
-            let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+            #[cfg(not(any(target_os = "macos", windows)))]
+            {
+                #[cfg(target_os = "linux")]
+                if reveal_in_file_manager(&path).is_ok() {
+                    return;
+                }
+                let folder = if path.is_dir() {
+                    path
+                } else {
+                    path.parent().map(Path::to_path_buf).unwrap_or(path)
+                };
+                let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+            }
         })
         .ok();
 }
 
+#[cfg(target_os = "linux")]
 fn reveal_in_file_manager(path: &Path) -> Result<(), zbus::Error> {
     let connection = zbus::blocking::Connection::session()?;
     let uri = file_uri(path);

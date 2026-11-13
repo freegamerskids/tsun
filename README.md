@@ -6,13 +6,34 @@ A native Rust TIDAL client built with [Rune](https://github.com/anomalyco/rune).
 
 - Rust and Cargo
 - A TIDAL account and subscription with streaming access
-- On Linux, development packages for ALSA, Wayland and xkbcommon
-- The FFmpeg development libraries for video: `libavcodec`, `libavformat`,
-  `libavutil`, `libswresample` and `libswscale` (the `ffmpeg` package's `-dev`/`-devel`
-  files; `pkg-config --exists libavcodec` must succeed). Tsun links them for H.264/AAC
-  decoding; the same libraries are what the system `ffmpeg` package ships.
-- A C toolchain and libclang for `ffmpeg-sys-next`'s bindgen step (`clang` on most
-  distributions).
+- FFmpeg **8.x** development libraries for video: `libavcodec`, `libavformat`,
+  `libavutil`, `libswresample` and `libswscale`. Tsun links them for H.264/AAC decoding.
+  `ffmpeg-next` 8.x does not compile against FFmpeg 9 headers.
+- A C toolchain and libclang for `ffmpeg-sys-next`'s bindgen step.
+
+Per platform:
+
+| Platform | Setup |
+| --- | --- |
+| Linux | Development packages for ALSA, Wayland, xkbcommon and FFmpeg 8 (`pkg-config --exists libavcodec` must succeed), plus `clang`. |
+| macOS | `brew install ffmpeg@8 pkgconf`, then build with `PKG_CONFIG_PATH="$(brew --prefix ffmpeg@8)/lib/pkgconfig"`. |
+| Windows (MSVC) | Unpack an FFmpeg 8 *shared* build (headers, `.lib` files and DLLs), point `FFMPEG_DIR` at it, put its `bin` on `PATH`, and set `LIBCLANG_PATH` to LLVM's `bin`. Ship the DLLs beside `tsun.exe`. |
+
+Where the README says `$XDG_CONFIG_HOME/tsun` and `$XDG_CACHE_HOME/tsun`: those variables win
+on every platform when set. Without them the files live in `~/.config/tsun` and `~/.cache/tsun`
+on Linux and macOS, and in `%APPDATA%\tsun` and `%LOCALAPPDATA%\tsun` on Windows. The `0600`
+file modes apply on Unix; on Windows the profile directory's ACL is the protection.
+
+Not everything exists everywhere:
+
+| Feature | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| Playback, video, local files, Last.fm | Yes | Yes | Yes |
+| Discord Rich Presence | Unix socket | Unix socket (`$TMPDIR`) | Named pipe (`\\.\pipe\discord-ipc-N`) |
+| Media keys / desktop media controls | MPRIS2 | No | No |
+| Track-change notifications | Yes (D-Bus) | No | No |
+| Tray icon / close to tray | StatusNotifierItem | No | Yes |
+| Show in file manager | FileManager1 / `xdg-open` | Finder | Explorer |
 
 Run with `cargo run`. For hi-res, sign in using the app's authorization-code flow. After signing in in your browser, copy the final redirected URL into the app. TIDAL may show an error page at that URL; the URL itself contains the authorization code. The device flow is easier but may be limited to lossy quality.
 

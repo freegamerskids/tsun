@@ -107,12 +107,7 @@ fn save(searches: &[String]) {
 }
 
 fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
-    Some(base.join("tsun").join("recent_searches.json"))
+    Some(crate::paths::config_dir()?.join("recent_searches.json"))
 }
 
 #[cfg(test)]

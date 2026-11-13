@@ -6,8 +6,6 @@
 //! partial file loads cleanly, and a corrupt one falls back to [`Settings::default`].
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -177,33 +175,13 @@ impl Settings {
             let _ = fs::create_dir_all(dir);
         }
         let Ok(text) = serde_json::to_vec_pretty(self) else { return };
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true).mode(0o600);
-        if let Ok(mut file) = options.open(&path) {
-            let _ = file.write_all(&text);
-        }
+        let _ = crate::paths::write_private(&path, &text);
     }
 }
 
-/// `$XDG_CONFIG_HOME/tsun/settings.json`, or `~/.config/tsun/settings.json`.
+/// `settings.json` in [`crate::paths::config_dir`].
 fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(fallback_config_base)?;
-    Some(base.join("tsun").join("settings.json"))
-}
-
-/// Without `XDG_CONFIG_HOME`: `~/.config`. The unit tests get a scratch directory instead, so a
-/// test that navigates (which remembers the route) can never rewrite the developer's settings.
-#[cfg(not(test))]
-fn fallback_config_base() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
-}
-
-#[cfg(test)]
-fn fallback_config_base() -> Option<PathBuf> {
-    Some(std::env::temp_dir().join("tsun-unit-test-config"))
+    Some(crate::paths::config_dir()?.join("settings.json"))
 }
 
 /// `XDG_CONFIG_HOME` is process-wide, so tests that *write* settings (through

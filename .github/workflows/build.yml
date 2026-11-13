@@ -10,17 +10,19 @@ on:
 permissions:
   contents: write # only used to attach the build to a release when a v* tag is pushed
 
+# Video playback links FFmpeg 8 (`ffmpeg-next` 8.x needs the 8.x headers; FFmpeg 9's do not
+# compile with it). Every job below pins an FFmpeg 8 package: move them together with the crate.
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build:
+  linux:
     name: Linux x86_64
     runs-on: ubuntu-latest
-    # Video playback links FFmpeg 8 (`ffmpeg-next` 8.x needs the 8.x headers). Fedora ships
-    # it as `ffmpeg-free`, so the build runs in a Fedora container instead of on the Ubuntu
-    # runner, whose repositories only carry older FFmpeg releases. Pinned to 44: Fedora 45's
-    # FFmpeg 9 headers do not compile with `ffmpeg-next` 8.x. Move both together.
+    # Fedora ships FFmpeg 8 as `ffmpeg-free`, so the build runs in a Fedora container instead of
+    # on the Ubuntu runner, whose repositories only carry older FFmpeg releases. Pinned to 44:
+    # Fedora 45 has FFmpeg 9.
     container: fedora:44
-    env:
-      CARGO_TERM_COLOR: always
     steps:
       - name: Install build dependencies
         run: |
@@ -58,5 +60,100 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: tsun-linux-x86_64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  macos:
+    name: macOS arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          brew install ffmpeg@8 pkgconf
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      # The binary links Homebrew's FFmpeg 8 dynamically: it needs `brew install ffmpeg@8` to run.
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/tsun README.md dist/
+          tar -C dist -czf tsun-macos-arm64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tsun-macos-arm64
+          path: tsun-macos-arm64.tar.gz
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tsun-macos-arm64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    env:
+      # BtbN's shared build: headers, import libraries and the DLLs the binary loads.
+      FFMPEG_BUILD: ffmpeg-n8.1-latest-win64-lgpl-shared-8.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg 8
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$env:FFMPEG_BUILD.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath $env:RUNNER_TEMP
+          $dir = Join-Path $env:RUNNER_TEMP $env:FFMPEG_BUILD
+          "FFMPEG_DIR=$dir" >> $env:GITHUB_ENV
+          "$dir\bin" >> $env:GITHUB_PATH
+          # bindgen (ffmpeg-sys-next) needs libclang; the runner image ships LLVM here.
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # Compiled, not run: the suite has only ever been exercised on Linux and macOS.
+      - name: Build tests
+        run: cargo test --release --locked --no-run
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target\release\tsun.exe, README.md dist\
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" dist\
+          Compress-Archive -Path dist\* -DestinationPath tsun-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tsun-windows-x86_64
+          path: tsun-windows-x86_64.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tsun-windows-x86_64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

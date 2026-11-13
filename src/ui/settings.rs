@@ -381,7 +381,11 @@ fn audio_body(s: &Ui, p: Palette) -> El {
             p,
             "settings-output-row",
             "Playback device",
-            Some("Applied immediately, at the position that was playing. A raw ALSA hw: device gives an exclusive path."),
+            Some(if cfg!(target_os = "linux") {
+                "Applied immediately, at the position that was playing. A raw ALSA hw: device gives an exclusive path."
+            } else {
+                "Applied immediately, at the position that was playing."
+            }),
             output_trigger(s, p),
         ),
     );

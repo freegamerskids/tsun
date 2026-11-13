@@ -11,8 +11,6 @@
 //! list and asks this module to load, record and persist it.
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -113,11 +111,7 @@ pub(crate) fn save(entries: &[PlayEntry]) {
         let _ = fs::create_dir_all(dir);
     }
     let Ok(text) = serde_json::to_vec_pretty(&Store { entries: entries.to_vec() }) else { return };
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
-    if let Ok(mut file) = options.open(&path) {
-        let _ = file.write_all(&text);
-    }
+    let _ = crate::paths::write_private(&path, &text);
 }
 
 /// Unix seconds now, for a new entry's timestamp.
@@ -128,13 +122,9 @@ pub(crate) fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// `$XDG_CONFIG_HOME/tsun/play_history.json`, or `~/.config/tsun/play_history.json`.
+/// `play_history.json` in [`crate::paths::config_dir`].
 fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("tsun").join("play_history.json"))
+    Some(crate::paths::config_dir()?.join("play_history.json"))
 }
 
 #[cfg(test)]

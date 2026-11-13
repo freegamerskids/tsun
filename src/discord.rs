@@ -2,8 +2,9 @@
 //!
 //! A running Discord desktop client listens on a Unix socket — `$XDG_RUNTIME_DIR/discord-ipc-N`,
 //! under `$XDG_RUNTIME_DIR/app/com.discordapp.Discord/` in the Flatpak build, under
-//! `$XDG_RUNTIME_DIR/snap.discord/` in the Snap, with `/tmp/discord-ipc-N` as the historic
-//! fallback — and takes frames of `u32` little-endian opcode, `u32` little-endian payload
+//! `$XDG_RUNTIME_DIR/snap.discord/` in the Snap, with `$TMPDIR/discord-ipc-N` (macOS, and the
+//! historic `/tmp` fallback) — or, on Windows, on the named pipe `\\.\pipe\discord-ipc-N`. It
+//! takes frames of `u32` little-endian opcode, `u32` little-endian payload
 //! length and a JSON payload. After a handshake (op `0`,
 //! `{"v":1,"client_id":"…"}`) it answers `READY` and accepts `SET_ACTIVITY` frames (op `1`) that
 //! set or clear this process's presence.
@@ -20,7 +21,8 @@
 //! `SET_ACTIVITY` frames per twenty seconds); dropping the client clears the presence.
 
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as IpcStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -31,6 +33,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 
 use crate::media_events::{MediaEvent, MediaTrack};
+
+#[cfg(windows)]
+mod pipe;
+#[cfg(windows)]
+use pipe::PipeStream as IpcStream;
 
 /// Frame opcodes of the Discord IPC protocol.
 const OP_HANDSHAKE: u32 = 0;
@@ -413,7 +420,7 @@ enum FramePoll {
 /// into a buffer (rather than `read_exact` on each part) keeps a frame that a timeout cut in
 /// half from being lost.
 struct Conn {
-    stream: UnixStream,
+    stream: IpcStream,
     buf: Vec<u8>,
     user: String,
 }
@@ -428,7 +435,6 @@ impl Conn {
     ) -> Result<Conn, ConnectError> {
         set_status(status, Status::Connecting);
         let (path, stream) = connect_socket(runtime)?;
-        stream.set_read_timeout(Some(READ_TIMEOUT)).ok();
         let mut conn = Conn { stream, buf: Vec::new(), user: String::new() };
         conn.send(OP_HANDSHAKE, &json!({ "v": 1, "client_id": config.client_id }))
             .map_err(|error| ConnectError::Failed(format!("{}: {error}", path.display())))?;
@@ -571,11 +577,12 @@ enum ConnectError {
     Failed(String),
 }
 
-/// Connects to the first candidate socket that accepts, skipping the stale ones.
-fn connect_socket(runtime: Option<&Path>) -> Result<(PathBuf, UnixStream), ConnectError> {
+/// Connects to the first candidate socket that accepts, skipping the stale ones. A read on the
+/// returned stream gives up after [`READ_TIMEOUT`].
+fn connect_socket(runtime: Option<&Path>) -> Result<(PathBuf, IpcStream), ConnectError> {
     let mut last_error = None;
     for path in socket_candidates(runtime) {
-        match UnixStream::connect(&path) {
+        match connect_stream(&path) {
             Ok(stream) => return Ok((path, stream)),
             Err(error) if is_missing(&error) => {}
             Err(error) => last_error = Some(format!("{}: {error}", path.display())),
@@ -587,17 +594,31 @@ fn connect_socket(runtime: Option<&Path>) -> Result<(PathBuf, UnixStream), Conne
     }
 }
 
+#[cfg(unix)]
+fn connect_stream(path: &Path) -> io::Result<IpcStream> {
+    let stream = IpcStream::connect(path)?;
+    stream.set_read_timeout(Some(READ_TIMEOUT)).ok();
+    Ok(stream)
+}
+
+#[cfg(windows)]
+fn connect_stream(path: &Path) -> io::Result<IpcStream> {
+    IpcStream::connect(path, READ_TIMEOUT)
+}
+
 /// A candidate that is not there (or is a socket file whose Discord has gone) is simply the
-/// next candidate's problem.
+/// next candidate's problem. So is one whose path no socket address can hold (`sun_path` is
+/// 104 bytes on macOS, 108 on Linux): nothing can be listening there.
 fn is_missing(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused | io::ErrorKind::InvalidInput
     )
 }
 
 /// Every path a Discord client may listen on, most likely first. Discord's own client uses the
-/// runtime dir, the Flatpak and Snap builds nest one below it, and older builds used `/tmp`.
+/// runtime dir, the Flatpak and Snap builds nest one below it, and macOS and older builds use
+/// the temp dir. On Windows it is a named pipe.
 fn socket_candidates(runtime: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(dir) = runtime {
@@ -605,6 +626,10 @@ fn socket_candidates(runtime: Option<&Path>) -> Vec<PathBuf> {
             for index in 0..10 {
                 paths.push(dir.join(sub).join(format!("discord-ipc-{index}")));
             }
+        }
+    } else if cfg!(windows) {
+        for index in 0..10 {
+            paths.push(PathBuf::from(format!(r"\\.\pipe\discord-ipc-{index}")));
         }
     } else {
         if let Some(dir) = env_path("XDG_RUNTIME_DIR") {
@@ -943,24 +968,29 @@ fn notify(wake: &Option<Wake>) {
     }
 }
 
-#[cfg(test)]
+// The fake Discord these tests talk to listens on a Unix socket.
+#[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::fs;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     fn temp_dir(name: &str) -> TempDir {
         TempDir::new(name)
     }
 
-    /// A directory that removes itself, for fake-socket files.
+    /// A directory that removes itself, for fake-socket files. Its name stays short: a socket
+    /// path must fit `sun_path`, and macOS's temp dir alone takes half of that.
     struct TempDir(PathBuf);
 
     impl TempDir {
         fn new(name: &str) -> TempDir {
-            let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let path = std::env::temp_dir().join(format!("tsun-discord-{}-{name}-{unique}", std::process::id()));
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("tsun-dc-{}-{name}-{unique}", std::process::id()));
+            // A crashed run with a recycled pid may have left one behind.
+            let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
             TempDir(path)
         }

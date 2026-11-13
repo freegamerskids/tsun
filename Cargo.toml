@@ -30,12 +30,19 @@ symphonia = { version = "0.5.5", default-features = false, features = ["flac", "
 # Pure-Rust tag reader/writer for the local library (title, artist, album, track/disc, year,
 # embedded cover, ReplayGain).
 lofty = "0.22"
-# MPRIS2 desktop integration (Linux media keys / panel widgets). See src/mpris.rs.
-zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 # Video decoding. TIDAL's music videos are H.264 High with B-frames, which the
 # pure-Rust/vendored openh264 decoder cannot decode; libavcodec can, and
 # libavformat's HLS demuxer does the segment fetching and look-ahead.
 ffmpeg-next = "8.1"
+
+# D-Bus desktop integration: MPRIS2 (media keys / panel widgets, src/mpris.rs), track
+# notifications (src/notify.rs) and "show in file manager".
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+
+# Discord's IPC named pipe has no read timeout; `PeekNamedPipe` stands in. See src/discord/pipe.rs.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes"] }
 
 # `cargo run` builds the dev profile. Unoptimized, the UI toolkit (layout, text shaping, the
 # renderer) is an order of magnitude slower than in release and long lists stutter, so the

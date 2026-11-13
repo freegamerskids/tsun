@@ -1188,7 +1188,11 @@ fn open_output(device_name: Option<&str>, audio: &Arc<AudioShared>) -> Result<Ou
                 format!("the audio output device “{name}” is not available; pick another one in Settings")
             })?,
         None => host.default_output_device().ok_or_else(|| {
-            "no audio output device is available; check that PipeWire/PulseAudio (or ALSA) is running".to_string()
+            if cfg!(target_os = "linux") {
+                "no audio output device is available; check that PipeWire/PulseAudio (or ALSA) is running".to_string()
+            } else {
+                "no audio output device is available; check the system's sound settings".to_string()
+            }
         })?,
     };
 

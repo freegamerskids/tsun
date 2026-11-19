@@ -1253,7 +1253,7 @@ mod tests {
             return;
         }
         use crate::discord::{Config as DiscordConfig, Discord};
-        use crate::lastfm::{LastFm, tests::Mock as LastFmMock};
+        use crate::lastfm::{Client as ScrobbleClient, LASTFM, tests::Mock as LastFmMock};
         use crate::media_hub::MediaHub;
 
         let config_home = ConfigHome::new("integrations");
@@ -1289,8 +1289,8 @@ mod tests {
         // else in the process reads them.
         unsafe {
             std::env::set_var("TSUN_LASTFM_API_BASE", mock.base.clone());
-            std::env::set_var("TSUN_LASTFM_MIN_TRACK_SECS", "0");
-            std::env::set_var("TSUN_LASTFM_MIN_PLAYED_SECS", "0");
+            std::env::set_var("TSUN_SCROBBLE_MIN_TRACK_SECS", "0");
+            std::env::set_var("TSUN_SCROBBLE_MIN_PLAYED_SECS", "0");
         }
 
         let waker: Waker = Arc::new(|| {});
@@ -1310,8 +1310,8 @@ mod tests {
         hub.set_discord(Some(discord.sink()));
         assert!(fake.next_handshake(Duration::from_secs(5)).is_some(), "the fake Discord handshook");
         // A real Last.fm client against the mock API.
-        let lastfm = LastFm::start(Arc::clone(&waker));
-        hub.set_lastfm(Some(lastfm.sink()));
+        let lastfm = ScrobbleClient::start(&LASTFM, Arc::clone(&waker));
+        hub.set_scrobbling(vec![lastfm.sink()]);
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
@@ -1420,8 +1420,8 @@ mod tests {
         // SAFETY: as above; the test that set them is done with the thread.
         unsafe {
             std::env::remove_var("TSUN_LASTFM_API_BASE");
-            std::env::remove_var("TSUN_LASTFM_MIN_TRACK_SECS");
-            std::env::remove_var("TSUN_LASTFM_MIN_PLAYED_SECS");
+            std::env::remove_var("TSUN_SCROBBLE_MIN_TRACK_SECS");
+            std::env::remove_var("TSUN_SCROBBLE_MIN_PLAYED_SECS");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

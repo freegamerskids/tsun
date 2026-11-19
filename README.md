@@ -101,6 +101,7 @@ Status reflects what the current source implements; *Partial* means the feature 
 | MPRIS / media keys | Supported | `org.mpris.MediaPlayer2.tsun` — play/pause/stop, next/previous, seek and volume, plus metadata, artwork, position and length; while a video is open the media keys control the video. What is playing also keeps the service up to date on its own thread, so it does not wait for the window to be drawn. Play/pause (media key or tray) goes straight to the player thread, so it still works while the window is hidden or not being drawn; next/previous, stop, and starting playback from nothing wait for the next frame, because they need the UI's queue and state. |
 | Notifications | Supported | Freedesktop `org.freedesktop.Notifications` on track change, with cover art; off by default. |
 | Last.fm scrobbling | Supported | The user's own API key and shared secret (from last.fm/api/account/create) drive `auth.getToken` → browser authorization → `auth.getSession`; `track.updateNowPlaying` on a track's start and `track.scrobble` once a play passes the official threshold (longer than 30 s, and half the track or four minutes, whichever comes first, counting real pause/seek-aware played time). Failed submissions retry from an on-disk queue with backoff; invalid ones are dropped. Local files scrobble too when they carry a title and artist. What tsun plays reaches the scrobble thread from the playback thread, so scrobbling, the Discord presence, MPRIS and desktop notifications all keep up while the window is not being drawn. All network runs on its own thread. |
+| scrobble.now scrobbling | Supported | [scrobble.now](https://scrobble.now) speaks the same Last.fm 2.0 API; tsun ships its own key for it (the service does not gate keys), so the card is just Connect → browser approval → **I've authorized**, and its session and switches live in `scrobblenow.json`. It runs beside Last.fm with its own `scrobblenow_queue.json`: either or both can be connected, and each has its own scrobble / now-playing / love switches. Last.fm's API becomes paid on 1 December, which is what makes a compatible service worth connecting. |
 | Discord Rich Presence | Supported | `discord` — tsun's own IPC client for the Discord desktop app (`$XDG_RUNTIME_DIR/discord-ipc-N`, the Flatpak and Snap paths, `/tmp`), on its own thread with reconnect. It works out of the box under tsun's built-in Discord application (public Application ID `1280598966471491594`); the Settings card also takes an optional own Application ID (an override) and an activity name. Presence: title, artist and album, TIDAL cover art in the activity's `assets`, an elapsed/remaining bar and a "Listen on TIDAL" button (which Discord shows to other people only); each part can be switched off. Playback changes reach it from the playback thread, so the presence keeps up while the window is not being drawn. Off by default. |
 | Full-screen Now Playing | Supported | Overlay with large cover art, links, a seek bar, the full transport and synced lyrics; closed with Escape or the minimize button, background tinted by the cover's average colour. |
 | Music videos (browse) | Supported | Videos tab in search, Videos carousel on artist pages, Videos tab in Collection; 16:9 thumbnails with duration and quality; favourite hearts. Data from `/search` (`VIDEOS`), `/artists/{id}/videos`, `/users/{id}/favorites/videos` and `/videos/{id}`. |
@@ -193,6 +194,28 @@ and every submission — happens on its own thread, so the window never stalls.
 Local files scrobble too: their title, artist, album and duration come from the file's tags, and
 the artist falls back to the album artist when the artist tag is missing. A file with neither tag
 has no artist to scrobble, so it is skipped and the app says so rather than guessing one.
+
+## scrobble.now scrobbling
+
+[scrobble.now](https://scrobble.now) is a Last.fm-compatible scrobbling service: it answers the
+same Last.fm 2.0 API (signed `auth.getToken` / `auth.getSession` / `track.updateNowPlaying` /
+`track.scrobble` / `track.love` requests) under `/2.0/` and authorizes through its own page at
+`/api/auth/`. tsun ships an application key for it — the service does not gate API keys — so
+Settings' **scrobble.now scrobbling** card needs no fields: press **Connect**, approve tsun in the
+browser page it opens, then press **I've authorized**, and the card shows **Connected as <your
+username>**. **Disconnect** forgets the session.
+
+It runs *beside* Last.fm rather than replacing it: the two cards are independent, and each has its
+own session, its own switches (Scrobble, Send now playing, and bringing the TIDAL heart over with
+`track.love`/`track.unlove`), its own offline queue and its own status line. With both connected,
+a play sends `track.updateNowPlaying` and one scrobble to each, and a TIDAL favourite loves the
+track on both — turn a card's switches off (or disconnect it) to stop just that one. The files are
+`$XDG_CONFIG_HOME/tsun/scrobblenow.json` (0600) and `scrobblenow_queue.json`, beside Last.fm's
+`lastfm.json` and `lastfm_queue.json`; nothing is ever written to `settings.json`.
+
+Last.fm is paywalling its API from 1 December; if you would rather not keep that subscription,
+scrobble.now is the drop-in alternative, and the rules are the same ones the Last.fm card states
+below (longer than 30 s, half the track or four minutes, pause- and seek-aware).
 
 ## Performance
 

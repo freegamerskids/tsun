@@ -1,15 +1,16 @@
 //! The fan-out every integration that follows playback listens to.
 //!
 //! The thread that owns the audio (the worker) reports what is playing here, and this hub runs
-//! its own relay thread that drives Last.fm, Discord, MPRIS and desktop notifications from it.
+//! its own relay thread that drives the scrobbling services, Discord, MPRIS and desktop
+//! notifications from it.
 //! That is what keeps them in step when the window is not being drawn at all: a covered or
 //! hidden Wayland window gets no frame callbacks, so Rune's `poll` does not run, and nothing
 //! driven from a frame can update — the presence would keep showing the previous track until
 //! the window came back.
 //!
-//! The UI still *configures* the integrations (it owns the Discord client, the Last.fm card and
-//! the notification switch) and hands their event sinks over with
-//! [`MediaHub::set_discord`]/[`MediaHub::set_lastfm`]/[`MediaHub::set_mpris`]/
+//! The UI still *configures* the integrations (it owns the Discord client, the scrobbling
+//! clients and the notification switch) and hands their event sinks over with
+//! [`MediaHub::set_discord`]/[`MediaHub::set_scrobbling`]/[`MediaHub::set_mpris`]/
 //! [`MediaHub::set_notifier`]; it also pushes the few things only it sees (the user's volume, a
 //! video taking the transport over). Anything the integrations want the *user* to see comes back
 //! through [`MediaHub::take_notes`], which `poll` drains.
@@ -22,7 +23,7 @@ use rune::Waker;
 
 use crate::art;
 use crate::discord::DiscordSink;
-use crate::lastfm::LastFmSink;
+use crate::lastfm::Sink;
 use crate::media_events::{MediaEvent, MediaTrack};
 use crate::mpris::{Mpris, MprisMeta, MprisPlayback};
 use crate::notify::{Notification, Notifier};
@@ -55,7 +56,7 @@ fn metadata_of(track: &MediaTrack) -> MprisMeta {
 /// raised while the window was frozen appears as soon as it is drawn again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MediaNote {
-    /// A track Last.fm cannot scrobble was skipped: it has no artist tag.
+    /// A track the scrobbling services cannot identify was skipped: it has no artist tag.
     NoArtistTag { title: String },
 }
 
@@ -125,7 +126,9 @@ pub(crate) struct MediaHub {
     waker: Mutex<Option<Waker>>,
     notes: Mutex<Vec<MediaNote>>,
     discord: Mutex<Option<DiscordSink>>,
-    lastfm: Mutex<Option<LastFmSink>>,
+    /// The scrobbling services' sinks (Last.fm and scrobble.now): every event goes to each of
+    /// them, and each decides for itself whether it sends anything.
+    scrobbling: Mutex<Vec<Sink>>,
     mpris: Mutex<Option<Arc<dyn MprisSink>>>,
     notifier: Mutex<Option<Notifier>>,
     published: Mutex<Published>,
@@ -143,7 +146,7 @@ impl MediaHub {
             waker: Mutex::new(None),
             notes: Mutex::new(Vec::new()),
             discord: Mutex::new(None),
-            lastfm: Mutex::new(None),
+            scrobbling: Mutex::new(Vec::new()),
             mpris: Mutex::new(None),
             notifier: Mutex::new(None),
             published: Mutex::new(Published::default()),
@@ -190,9 +193,10 @@ impl MediaHub {
         *self.discord.lock().unwrap() = sink;
     }
 
-    /// The sink the Last.fm client's playback events go to.
-    pub(crate) fn set_lastfm(&self, sink: Option<LastFmSink>) {
-        *self.lastfm.lock().unwrap() = sink;
+    /// The sinks the scrobbling clients' playback events go to: one per connected service, so
+    /// Last.fm and scrobble.now can follow playback at the same time.
+    pub(crate) fn set_scrobbling(&self, sinks: Vec<Sink>) {
+        *self.scrobbling.lock().unwrap() = sinks;
     }
 
     /// The MPRIS service the hub publishes to.
@@ -262,8 +266,8 @@ impl MediaHub {
         if let Some(discord) = self.discord.lock().unwrap().as_ref() {
             discord.media_event(&event);
         }
-        if let Some(lastfm) = self.lastfm.lock().unwrap().as_ref() {
-            lastfm.handle(event.clone());
+        for sink in self.scrobbling.lock().unwrap().iter() {
+            sink.handle(event.clone());
         }
         if let MediaEvent::Started { track, .. } = &event {
             self.notify(track);
@@ -322,19 +326,15 @@ impl MediaHub {
         sink.set_position(0);
     }
 
-    /// Raises the note the UI shows for a track Last.fm cannot scrobble.
+    /// Raises the note the UI shows for a track the scrobbling services cannot identify. Two
+    /// services both skipping it is still one note: the user has one untagged file, not two.
     fn note(&self, event: &MediaEvent) {
         let MediaEvent::Started { track, .. } = event else { return };
         if !track.artist.trim().is_empty() {
             return;
         }
-        let lastfm_enabled = self
-            .lastfm
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(LastFmSink::enabled);
-        if !lastfm_enabled {
+        let scrobbling = self.scrobbling.lock().unwrap().iter().any(Sink::enabled);
+        if !scrobbling {
             return;
         }
         self.notes.lock().unwrap().push(MediaNote::NoArtistTag { title: track.title.clone() });

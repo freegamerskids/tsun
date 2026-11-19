@@ -82,7 +82,7 @@ impl Ui {
     /// check what an integration would see.
     #[cfg(test)]
     pub(crate) fn emit_media(&mut self, event: MediaEvent) {
-        self.media.set_lastfm(self.lastfm.as_ref().map(crate::lastfm::LastFm::sink));
+        self.media.set_scrobbling(self.scrobbling.iter().map(crate::lastfm::Client::sink).collect());
         self.media.set_discord(self.discord.as_ref().map(crate::discord::Discord::sink));
         self.media.dispatch_now(event);
         self.poll_media();

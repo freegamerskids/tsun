@@ -205,7 +205,7 @@ fn section_body(s: &Ui, p: Palette) -> El {
             .w_full()
             .gap(14.0)
             .child(crate::ui::settings_discord::discord_card(s, p))
-            .child(crate::ui::settings_lastfm::lastfm_card(s, p)),
+            .child(crate::ui::settings_lastfm::scrobbling_cards(s, p)),
         SettingsSection::Account => account_body(s, p),
     }
 }

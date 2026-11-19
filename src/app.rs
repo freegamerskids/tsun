@@ -16,7 +16,7 @@ use crate::audio::Volume;
 use crate::cover::CoverArt;
 use crate::history::{History, Route};
 use crate::history_log::{self, PlayEntry};
-use crate::lastfm::LastFm;
+use crate::lastfm;
 use crate::local;
 use crate::mpris::{Mpris, MprisCommand, MprisMeta, MprisPlayback, MprisTransport};
 use crate::notify::Notifier;
@@ -601,9 +601,9 @@ pub(crate) struct Ui {
     /// UI publishes a video's own state while the video view owns the transport.
     pub(crate) mpris: Option<Arc<Mpris>>,
     pub(crate) mpris_rx: Option<Receiver<MprisCommand>>,
-    /// Last.fm scrobbling, when the thread could be started. The card reads its state; playback
-    /// events reach it through [`Ui::emit_media`].
-    pub(crate) lastfm: Option<LastFm>,
+    /// One client per scrobbling service (Last.fm and scrobble.now), each with its own thread,
+    /// store and card. Playback events reach them through the media hub.
+    pub(crate) scrobbling: Vec<lastfm::Client>,
     /// The scanned local-file library and the state of its background scan.
     pub(crate) local: local::Library,
     /// One-off files from the command line or a drop, which are not in any scanned folder but
@@ -839,7 +839,7 @@ pub(crate) fn init() -> Ui {
         mpris_volume: None,
         mpris: None,
         mpris_rx: None,
-        lastfm: None,
+        scrobbling: Vec::new(),
         local: local::Library::default(),
         local_extra: HashMap::new(),
         local_state: SearchState::Idle,
@@ -936,9 +936,13 @@ pub(crate) fn setup(s: &mut Ui, waker: Waker) {
     }
     s.mpris_rx = Some(forward_rx);
     s.covers = Some(CoverArt::new(waker.clone()));
-    // Last.fm scrobbling on its own thread, so its network work never touches a frame.
-    s.lastfm = Some(LastFm::start(waker.clone()));
-    s.media.set_lastfm(s.lastfm.as_ref().map(LastFm::sink));
+    // Scrobbling, one thread per service (Last.fm and scrobble.now), so their network work
+    // never touches a frame and the two can run side by side.
+    s.scrobbling = lastfm::SERVICES
+        .iter()
+        .map(|service| lastfm::Client::start(service, waker.clone()))
+        .collect();
+    s.media.set_scrobbling(s.scrobbling.iter().map(lastfm::Client::sink).collect());
     // Local files: show the cached index at once and refresh it in the background.
     s.waker = Some(waker.clone());
     s.load_local_library();
@@ -1095,9 +1099,9 @@ pub(crate) fn poll(s: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
     }
     let mut changed = drain_events(s);
     changed |= drain_mpris(s, tx);
-    // Last.fm's scrobble thread reports connection and scrobble status back here.
-    changed |= s.poll_lastfm();
-    // What the integrations want the user to see (a track Last.fm cannot scrobble), raised
+    // The scrobble threads report connection and scrobble status back here.
+    changed |= s.poll_scrobbling();
+    // What the integrations want the user to see (a track no service can scrobble), raised
     // while the window may have been frozen.
     changed |= s.poll_media();
     // The Discord Rich Presence follows the settings and the field, and a status change (Discord
@@ -2532,11 +2536,12 @@ impl Ui {
             self.set_favorite_local(kind, id, !on);
             self.notice = Some(Notice::error("The TIDAL worker is not running."));
         }
-        // Mirror the heart on Last.fm. Only TIDAL tracks get here: a local id returned above.
+        // Mirror the heart on every connected service. Only TIDAL tracks get here: a local id
+        // returned above.
         if kind == FavKind::Track
             && let Ok(track_id) = id.parse::<u64>()
         {
-            self.lastfm_love(track_id, on);
+            self.scrobble_love(track_id, on);
         }
     }
 

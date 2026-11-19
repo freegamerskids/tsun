@@ -1,20 +1,28 @@
-//! Last.fm scrobbling.
+//! Scrobbling to Last.fm and to Last.fm-compatible services.
+//!
+//! The protocol is Last.fm's 2.0 API: a signed `application/x-www-form-urlencoded` POST, its
+//! JSON answers and its error codes. One engine speaks it for every [`Service`] tsun supports —
+//! Last.fm itself, and [scrobble.now](https://scrobble.now), a Last.fm-compatible scrobbling
+//! service — so a service is a descriptor (endpoints, files, credentials), not a second
+//! implementation. Each service has its own [`Store`], its own offline queue, its own thread and
+//! its own card in Settings, and both can run at the same time.
 //!
 //! The **scrobbling rules** are the official ones: a play is sent once when it has actually
 //! played for at least half its length or four minutes (whichever comes first), the track is
-//! longer than 30 seconds, and it is longer than 30 s; real played time is counted, so pausing
-//! stops the clock and seeking neither adds nor removes time. `track.updateNowPlaying` is sent
-//! when a track starts, and a played-so-far track is scrobbled when it ends, is skipped or the
-//! transport stops.
+//! longer than 30 seconds; real played time is counted, so pausing stops the clock and seeking
+//! neither adds nor removes time. `track.updateNowPlaying` is sent when a track starts, and a
+//! played-so-far track is scrobbled when it ends, is skipped or the transport stops.
 //!
-//! Everything that touches the network runs on a dedicated thread so the UI never blocks: the
-//! UI sends [`Command`]s and drains [`LastFmStatus`]s in `poll`. Failed submissions go to an
-//! on-disk queue (`lastfm_queue.json`) that is retried with backoff; submissions Last.fm rejects
-//! as permanently invalid are dropped instead of being retried forever.
+//! Everything that touches the network runs on a dedicated thread per service so the UI never
+//! blocks: the UI sends [`Command`]s and drains [`Status`]es in `poll`. Failed submissions go to
+//! that service's on-disk queue (`lastfm_queue.json`, `scrobblenow_queue.json`) and are retried
+//! with backoff; submissions the service rejects as permanently invalid are dropped instead of
+//! being retried forever.
 //!
-//! The user's own API key and shared secret (from <https://www.last.fm/api/account/create>) and
-//! the authorized session live in `lastfm.json` (0600) beside the rest of tsun's config, never
-//! in `settings.json`. tsun ships no key of its own.
+//! Credentials: Last.fm needs the user's own API key and shared secret (from
+//! <https://www.last.fm/api/account/create>), stored in `lastfm.json` (0600) beside the rest of
+//! tsun's config, never in `settings.json`. scrobble.now does not gate API keys, so tsun ships
+//! one for it (see [`SCROBBLENOW`]) and its card is just Connect.
 
 use std::fs;
 use std::path::PathBuf;
@@ -30,10 +38,6 @@ use serde::{Deserialize, Serialize};
 use crate::app::Ui;
 use crate::media_events::{MediaEvent, MediaTrack};
 
-/// Last.fm's API 2.0 endpoint. `Api::with_base` overrides it for the mock-server test.
-pub(crate) const API_BASE: &str = "https://ws.audioscrobbler.com/2.0/";
-/// Where the user authorizes a token in their browser.
-pub(crate) const AUTH_URL: &str = "https://www.last.fm/api/auth/";
 /// `track.scrobble` accepts up to 50 submissions per request.
 pub(crate) const BATCH: usize = 50;
 /// The offline queue never grows past this many plays; the oldest fall off.
@@ -42,6 +46,86 @@ const QUEUE_MAX: usize = 1000;
 const MIN_TRACK_SECS: u64 = 30;
 /// A play must reach half the track or this many seconds, whichever comes first.
 const MIN_PLAYED_SECS: f64 = 240.0;
+
+/// Credentials tsun ships for a service that does not gate API keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Credentials {
+    pub(crate) api_key: &'static str,
+    pub(crate) secret: &'static str,
+}
+
+/// One Last.fm-compatible scrobbling service.
+///
+/// Everything that differs between the services tsun speaks lives here; the engine ([`Api`],
+/// [`Store`], [`PendingQueue`], [`Scrobbler`]) takes it as a parameter.
+#[derive(Debug)]
+pub(crate) struct Service {
+    /// The stable identity used in tests ("lastfm", "scrobblenow").
+    pub(crate) id: &'static str,
+    /// The name shown to the user ("Last.fm", "scrobble.now").
+    pub(crate) name: &'static str,
+    /// The Last.fm 2.0 API endpoint.
+    pub(crate) api_base: &'static str,
+    /// Where the user authorizes a token in their browser.
+    pub(crate) auth_url: &'static str,
+    /// The environment variable a test points at a mock server instead of `api_base`; the app
+    /// never sets it.
+    pub(crate) api_base_env: &'static str,
+    /// `$XDG_CONFIG_HOME/tsun/<store_file>` (0600): credentials, session and the switches.
+    pub(crate) store_file: &'static str,
+    /// The on-disk offline queue beside it.
+    pub(crate) queue_file: &'static str,
+    /// Credentials tsun ships. `None` means the user registers an application and pastes its
+    /// key and secret (Last.fm).
+    pub(crate) builtin: Option<Credentials>,
+    /// The card's one-line description of what the service does.
+    pub(crate) description: &'static str,
+    /// The card's hint while disconnected: where the credentials come from.
+    pub(crate) connect_hint: &'static str,
+    /// The card's hint under the credential fields (Last.fm only).
+    pub(crate) credentials_help: &'static str,
+}
+
+/// Last.fm: the original, and still the one with the strongest rules.
+pub(crate) const LASTFM: Service = Service {
+    id: "lastfm",
+    name: "Last.fm",
+    api_base: "https://ws.audioscrobbler.com/2.0/",
+    auth_url: "https://www.last.fm/api/auth/",
+    api_base_env: "TSUN_LASTFM_API_BASE",
+    store_file: "lastfm.json",
+    queue_file: "lastfm_queue.json",
+    builtin: None,
+    description: "Send what you play to your Last.fm account.",
+    connect_hint: "Add your own Last.fm API key and shared secret, then press Connect.",
+    credentials_help: "tsun ships no API key: register an application at last.fm/api/account/create and paste its API key and shared secret here. They are stored in lastfm.json (0600), never in settings.json.",
+};
+
+/// scrobble.now (<https://scrobble.now>): a Last.fm-compatible scrobbling service. It answers
+/// the Last.fm 2.0 API under `/2.0/` and authorizes through its own page at `/api/auth/`.
+///
+/// It does not gate API keys — `auth.getToken` answers any key — so tsun ships its own pair and
+/// the card is just Connect. Neither value is a secret in the usual sense: the key is public,
+/// and the signature secret is only a fixed string that keeps the protocol's MD5 signature
+/// (every parameter plus the secret, sorted by name) intact. Nothing here can be locked out or
+/// revoked, and nothing is shared with any other service.
+pub(crate) const SCROBBLENOW: Service = Service {
+    id: "scrobblenow",
+    name: "scrobble.now",
+    api_base: "https://scrobble.now/2.0/",
+    auth_url: "https://scrobble.now/api/auth/",
+    api_base_env: "TSUN_SCROBBLENOW_API_BASE",
+    store_file: "scrobblenow.json",
+    queue_file: "scrobblenow_queue.json",
+    builtin: Some(Credentials { api_key: "tsun", secret: "0b7f4d2a9c6e1f3a8d5b7c9e2f4a6d81" }),
+    description: "Send what you play to scrobble.now, a Last.fm-compatible scrobbling service.",
+    connect_hint: "Press Connect and approve tsun in your browser — no API key is needed.",
+    credentials_help: "tsun connects to scrobble.now under its own application, so there is nothing to paste here.",
+};
+
+/// Every service tsun scrobbles to, in the order Settings lists them.
+pub(crate) const SERVICES: [&Service; 2] = [&LASTFM, &SCROBBLENOW];
+
 
 /// When a play counts as a scrobble: the track must be longer than `min_track_secs` and must
 /// have played for half its length or `max_played_secs`, whichever comes first.
@@ -60,14 +144,14 @@ impl Thresholds {
     pub(crate) const OFFICIAL: Thresholds =
         Thresholds { min_track_secs: MIN_TRACK_SECS, max_played_secs: MIN_PLAYED_SECS };
 
-    /// [`Thresholds::OFFICIAL`], overridable per variable for a test.
+    /// [`Thresholds::OFFICIAL`], overridable per variable for a test (the app never sets them).
     pub(crate) fn from_env() -> Thresholds {
         let number = |name: &str| std::env::var(name).ok().and_then(|value| value.trim().parse::<f64>().ok());
         Thresholds {
-            min_track_secs: number("TSUN_LASTFM_MIN_TRACK_SECS")
+            min_track_secs: number("TSUN_SCROBBLE_MIN_TRACK_SECS")
                 .map(|secs| secs.max(0.0) as u64)
                 .unwrap_or(MIN_TRACK_SECS),
-            max_played_secs: number("TSUN_LASTFM_MIN_PLAYED_SECS")
+            max_played_secs: number("TSUN_SCROBBLE_MIN_PLAYED_SECS")
                 .map(|secs| secs.max(0.0))
                 .unwrap_or(MIN_PLAYED_SECS),
         }
@@ -84,11 +168,13 @@ fn default_true() -> bool {
 // ---------------------------------------------------------------------------------------------
 // Persisted state
 
-/// What tsun keeps for Last.fm: the user's API credentials, the authorized session and the
-/// feature toggles. Stored at `$XDG_CONFIG_HOME/tsun/lastfm.json` (0600).
+/// What tsun keeps for one scrobbling service: the API credentials, the authorized session and
+/// the feature toggles. Stored at `$XDG_CONFIG_HOME/tsun/<service.store_file>` (0600), and one
+/// file per service, so connecting both keeps them independent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Store {
+    /// The user's own API key (Last.fm). A service with [`Service::builtin`] ignores it.
     pub(crate) api_key: String,
     pub(crate) secret: String,
     pub(crate) session_key: String,
@@ -120,21 +206,32 @@ impl Store {
         !self.session_key.is_empty()
     }
 
-    /// The API key and secret are both present, so an authorization can be started.
-    pub(crate) fn has_credentials(&self) -> bool {
-        !self.api_key.trim().is_empty() && !self.secret.trim().is_empty()
+    /// The key and secret to sign with: the service's built-in pair when it ships one, the
+    /// user's own otherwise.
+    pub(crate) fn credentials<'a>(&'a self, service: &'static Service) -> (&'a str, &'a str) {
+        match &service.builtin {
+            Some(builtin) => (builtin.api_key, builtin.secret),
+            None => (self.api_key.trim(), self.secret.trim()),
+        }
     }
 
-    /// Loads the file, or defaults when it is missing or unreadable.
-    pub(crate) fn load() -> Store {
-        let Some(path) = path("lastfm.json") else { return Store::default() };
+    /// Whether the service can be authorized: a built-in pair always can, otherwise the user's
+    /// key and secret must both be present.
+    pub(crate) fn has_credentials(&self, service: &'static Service) -> bool {
+        let (api_key, secret) = self.credentials(service);
+        !api_key.is_empty() && !secret.is_empty()
+    }
+
+    /// Loads the service's file, or defaults when it is missing or unreadable.
+    pub(crate) fn load(service: &'static Service) -> Store {
+        let Some(path) = path(service.store_file) else { return Store::default() };
         let Ok(text) = fs::read_to_string(&path) else { return Store::default() };
         serde_json::from_str(&text).unwrap_or_default()
     }
 
-    /// Writes the file back, best-effort.
-    pub(crate) fn save(&self) {
-        let Some(path) = path("lastfm.json") else { return };
+    /// Writes the service's file back, best-effort.
+    pub(crate) fn save(&self, service: &'static Service) {
+        let Some(path) = path(service.store_file) else { return };
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
@@ -158,7 +255,8 @@ struct QueueStore {
     entries: Vec<Scrobble>,
 }
 
-/// The on-disk offline queue, retried with backoff while the network or Last.fm is failing.
+/// The on-disk offline queue, retried with backoff while the network or the service is failing.
+/// One per service: `lastfm_queue.json`, `scrobblenow_queue.json`.
 #[derive(Debug, Default)]
 pub(crate) struct PendingQueue {
     entries: Vec<Scrobble>,
@@ -169,22 +267,22 @@ pub(crate) struct PendingQueue {
 }
 
 impl PendingQueue {
-    /// Reads `lastfm_queue.json`, or an empty queue.
-    pub(crate) fn load() -> PendingQueue {
-        let Some(path) = path("lastfm_queue.json") else { return PendingQueue::default() };
+    /// Reads the service's queue file, or an empty queue.
+    pub(crate) fn load(service: &'static Service) -> PendingQueue {
+        let Some(path) = path(service.queue_file) else { return PendingQueue::default() };
         let Ok(bytes) = fs::read(&path) else { return PendingQueue::default() };
         let Ok(store) = serde_json::from_slice::<QueueStore>(&bytes) else { return PendingQueue::default() };
         PendingQueue { entries: store.entries, failures: 0, next_attempt: None }
     }
 
     /// Appends a play, dropping the oldest when the queue is full, and persists.
-    pub(crate) fn push(&mut self, scrobble: Scrobble) {
+    pub(crate) fn push(&mut self, scrobble: Scrobble, service: &'static Service) {
         self.entries.push(scrobble);
         if self.entries.len() > QUEUE_MAX {
             let overflow = self.entries.len() - QUEUE_MAX;
             self.entries.drain(..overflow);
         }
-        self.save();
+        self.save(service);
     }
 
     /// The number of plays still waiting.
@@ -201,9 +299,9 @@ impl PendingQueue {
         !self.entries.is_empty() && self.next_attempt.is_none_or(|at| now >= at)
     }
 
-    /// Writes the queue back, best-effort.
-    pub(crate) fn save(&self) {
-        let Some(path) = path("lastfm_queue.json") else { return };
+    /// Writes the service's queue file back, best-effort.
+    pub(crate) fn save(&self, service: &'static Service) {
+        let Some(path) = path(service.queue_file) else { return };
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
@@ -211,7 +309,7 @@ impl PendingQueue {
         write_private(&path, &text);
     }
 
-    /// Submits what it can, newest batches first. Entries Last.fm rejects with a
+    /// Submits what it can, newest batches first. Entries the service rejects with a
     /// permanently-invalid code are dropped; a transient failure stops the attempt and arms the
     /// backoff. Returns how many plays were accepted.
     pub(crate) fn flush(&mut self, api: &Api, store: &Store, now: f64) -> Result<usize, ApiError> {
@@ -261,7 +359,7 @@ impl PendingQueue {
             self.failures = 0;
             self.next_attempt = None;
         }
-        self.save();
+        self.save(api.service);
         failure.map_or(Ok(accepted), Err)
     }
 }
@@ -285,8 +383,8 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) {
 // ---------------------------------------------------------------------------------------------
 // API signatures and requests
 
-/// Last.fm's `api_sig`: the MD5 of every parameter's name and value concatenated in name order,
-/// with the shared secret appended. `format` (and the unused `callback`) are excluded.
+/// The Last.fm protocol's `api_sig`: the MD5 of every parameter's name and value concatenated in
+/// name order, with the shared secret appended. `format` (and the unused `callback`) are excluded.
 pub(crate) fn api_sig(params: &[(String, String)], secret: &str) -> String {
     let mut pairs: Vec<&(String, String)> = params
         .iter()
@@ -323,11 +421,11 @@ pub(crate) fn signed_form(
 pub(crate) enum ErrorDisposition {
     /// Keep it and try again later (network trouble, service offline, rate limit).
     Retry,
-    /// Drop it: Last.fm will never accept it.
+    /// Drop it: the service will never accept it.
     Drop,
 }
 
-/// Last.fm error codes that mean the submission itself is permanently invalid: invalid service,
+/// The protocol's error codes that mean the submission itself is permanently invalid: invalid service,
 /// method, format, authentication or session, bad parameters, unsupported resource, already
 /// acted on, the token was never authorized, and a suspended key.
 const DROP_CODES: &[i64] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 17, 18, 26];
@@ -347,7 +445,7 @@ pub(crate) fn classify(code: i64) -> ErrorDisposition {
 pub(crate) enum ApiError {
     /// The request never produced a usable answer (connection, timeout, 5xx).
     Network(String),
-    /// Last.fm answered with an error code and message.
+    /// The service answered with an error code and message.
     Api { code: i64, message: String },
 }
 
@@ -361,51 +459,61 @@ impl ApiError {
 
     pub(crate) fn message(&self) -> String {
         match self {
-            ApiError::Network(message) => format!("Last.fm network error: {message}"),
-            ApiError::Api { code, message } => format!("Last.fm error {code}: {message}"),
+            ApiError::Network(message) => message.clone(),
+            ApiError::Api { code, message } => format!("error {code}: {message}"),
         }
     }
 }
 
-/// The blocking Last.fm client. Owned by the scrobble thread; `Api::with_base` points it at a
-/// mock server for tests.
+/// The blocking Last.fm-protocol client for one service. Owned by that service's scrobble
+/// thread; `Api::with_base` points it at a mock server for tests.
 pub(crate) struct Api {
     agent: ureq::Agent,
     base: String,
+    pub(crate) service: &'static Service,
 }
 
 impl Api {
-    pub(crate) fn with_base(base: &str) -> Api {
+    /// The client for `service`, at its real endpoint — unless a test named another one in
+    /// `service.api_base_env`.
+    pub(crate) fn for_service(service: &'static Service) -> Api {
+        let base = std::env::var(service.api_base_env).unwrap_or_else(|_| service.api_base.to_owned());
+        Api::with_base(service, &base)
+    }
+
+    /// The client for `service` at an explicit base, for tests.
+    pub(crate) fn with_base(service: &'static Service, base: &str) -> Api {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(15)))
             .build();
-        Api { agent: ureq::Agent::new_with_config(config), base: base.to_owned() }
+        Api { agent: ureq::Agent::new_with_config(config), base: base.to_owned(), service }
     }
 
     fn call(&self, form: &[(String, String)]) -> Result<serde_json::Value, ApiError> {
+        let name = self.service.name;
         let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let mut response = self
             .agent
             .post(&self.base)
             .send_form(pairs)
-            .map_err(|error| ApiError::Network(error.to_string()))?;
+            .map_err(|error| ApiError::Network(format!("{name} network error: {error}")))?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
             .read_to_string()
-            .map_err(|error| ApiError::Network(error.to_string()))?;
+            .map_err(|error| ApiError::Network(format!("{name} network error: {error}")))?;
         if status == 429 {
             return Err(ApiError::Api { code: 29, message: "rate limit exceeded".to_owned() });
         }
         if status >= 500 {
-            return Err(ApiError::Network(format!("Last.fm returned HTTP {status}")));
+            return Err(ApiError::Network(format!("{name} returned HTTP {status}")));
         }
         if !(200..300).contains(&status) {
-            return Err(ApiError::Api { code: -1, message: format!("Last.fm returned HTTP {status}") });
+            return Err(ApiError::Api { code: -1, message: format!("{name} returned HTTP {status}") });
         }
         let value: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|error| ApiError::Network(format!("unreadable Last.fm response: {error}")))?;
+            .map_err(|error| ApiError::Network(format!("unreadable {name} response: {error}")))?;
         if let Some(code) = value.get("error").and_then(serde_json::Value::as_i64) {
             let message = value
                 .get("message")
@@ -418,56 +526,56 @@ impl Api {
     }
 
     /// `auth.getToken`: the token the user authorizes in their browser.
-    pub(crate) fn get_token(&self, api_key: &str, secret: &str) -> Result<String, ApiError> {
+    pub(crate) fn get_token(&self, store: &Store) -> Result<String, ApiError> {
+        let (api_key, secret) = store.credentials(self.service);
         let form = signed_form("auth.getToken", Vec::new(), api_key, secret);
         let value = self.call(&form)?;
         value
             .get("token")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| ApiError::Network("Last.fm did not return a token".to_owned()))
+            .ok_or_else(|| ApiError::Network(format!("{} did not return a token", self.service.name)))
     }
 
     /// `auth.getSession`: exchanges an authorized token for the session key and username.
-    pub(crate) fn get_session(
-        &self,
-        api_key: &str,
-        secret: &str,
-        token: &str,
-    ) -> Result<(String, String), ApiError> {
+    pub(crate) fn get_session(&self, store: &Store, token: &str) -> Result<(String, String), ApiError> {
+        let (api_key, secret) = store.credentials(self.service);
         let form = signed_form("auth.getSession", vec![("token".to_owned(), token.to_owned())], api_key, secret);
         let value = self.call(&form)?;
+        let name = self.service.name;
         let session = value
             .get("session")
-            .ok_or_else(|| ApiError::Network("Last.fm did not return a session".to_owned()))?;
+            .ok_or_else(|| ApiError::Network(format!("{name} did not return a session")))?;
         let key = session.get("key").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
-        let name = session.get("name").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        let username = session.get("name").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
         if key.is_empty() {
-            return Err(ApiError::Network("Last.fm returned an empty session key".to_owned()));
+            return Err(ApiError::Network(format!("{name} returned an empty session key")));
         }
-        Ok((key, name))
+        Ok((key, username))
     }
 
     /// `track.updateNowPlaying` for the track that just started.
     pub(crate) fn update_now_playing(&self, store: &Store, track: &MediaTrack) -> Result<(), ApiError> {
-        let mut form = signed_form("track.updateNowPlaying", track_params(track, None), &store.api_key, &store.secret);
+        let (api_key, secret) = store.credentials(self.service);
+        let mut form = signed_form("track.updateNowPlaying", track_params(track, None), api_key, secret);
         form.push(("sk".to_owned(), store.session_key.clone()));
-        // Re-sign now that `sk` is present: Last.fm requires every parameter signed.
-        resign(&mut form, &store.secret);
+        // Re-sign now that `sk` is present: the protocol requires every parameter signed.
+        resign(&mut form, secret);
         self.call(&form).map(|_| ())
     }
 
-    /// `track.scrobble` for up to [`BATCH`] plays; returns how many Last.fm accepted.
+    /// `track.scrobble` for up to [`BATCH`] plays; returns how many the service accepted.
     pub(crate) fn scrobble(&self, store: &Store, batch: &[Scrobble]) -> Result<usize, ApiError> {
+        let (api_key, secret) = store.credentials(self.service);
         let mut params = Vec::new();
         for (index, entry) in batch.iter().enumerate() {
             for (name, value) in track_params(&entry.track, Some(entry.at)) {
                 params.push((format!("{name}[{index}]"), value));
             }
         }
-        let mut form = signed_form("track.scrobble", params, &store.api_key, &store.secret);
+        let mut form = signed_form("track.scrobble", params, api_key, secret);
         form.push(("sk".to_owned(), store.session_key.clone()));
-        resign(&mut form, &store.secret);
+        resign(&mut form, secret);
         let value = self.call(&form)?;
         let accepted = value
             .pointer("/scrobbles/@attr/accepted")
@@ -478,14 +586,15 @@ impl Api {
 
     /// `track.love` / `track.unlove`.
     pub(crate) fn love(&self, store: &Store, title: &str, artist: &str, on: bool) -> Result<(), ApiError> {
+        let (api_key, secret) = store.credentials(self.service);
         let method = if on { "track.love" } else { "track.unlove" };
         let params = vec![
             ("artist".to_owned(), artist.to_owned()),
             ("track".to_owned(), title.to_owned()),
         ];
-        let mut form = signed_form(method, params, &store.api_key, &store.secret);
+        let mut form = signed_form(method, params, api_key, secret);
         form.push(("sk".to_owned(), store.session_key.clone()));
-        resign(&mut form, &store.secret);
+        resign(&mut form, secret);
         self.call(&form).map(|_| ())
     }
 }
@@ -607,8 +716,8 @@ impl Scrobbler {
     }
 }
 
-/// Whether a track carries what Last.fm needs (a title and an artist). A local file with no
-/// artist tag is skipped rather than mis-scrobbled.
+/// Whether a track carries what a scrobbling service needs (a title and an artist). A local file
+/// with no artist tag is skipped rather than mis-scrobbled.
 pub(crate) fn identifiable(track: &MediaTrack) -> bool {
     !track.title.trim().is_empty() && !track.artist.trim().is_empty()
 }
@@ -629,7 +738,7 @@ pub(crate) fn qualifies_with(
 // ---------------------------------------------------------------------------------------------
 // Worker thread
 
-/// Commands the UI sends to the scrobble thread.
+/// Commands the UI sends to one service's scrobble thread.
 pub(crate) enum Command {
     /// A playback event to fold into the scrobble state machine.
     Media(MediaEvent),
@@ -637,19 +746,19 @@ pub(crate) enum Command {
     Connect,
     /// The user authorized in their browser: exchange the token for a session.
     ConfirmAuth,
-    /// Forget the session key (the API key and secret are kept).
+    /// Forget the session key (whatever credentials the service uses are kept).
     Disconnect,
-    /// Store the API key and shared secret the user pasted.
+    /// Store the API key and shared secret the user pasted (services without built-in ones).
     SetCredentials { api_key: String, secret: String },
     /// Update the three toggles.
     SetPrefs { scrobble: bool, now_playing: bool, love: bool },
-    /// Love or unlove a track on Last.fm.
+    /// Love or unlove a track on the service.
     Love { title: String, artist: String, on: bool },
 }
 
 /// What the thread reports back to the UI.
 #[derive(Debug)]
-pub(crate) enum LastFmStatus {
+pub(crate) enum Status {
     Disconnected,
     /// A token was fetched; the user must open this URL (which embeds the token) and authorize.
     Authorizing { url: String },
@@ -660,17 +769,19 @@ pub(crate) enum LastFmStatus {
     Notice(String),
 }
 
-/// The UI side of Last.fm: the channel to the scrobble thread, the form fields and the state the
-/// card draws.
-pub(crate) struct LastFm {
+/// The UI side of one scrobbling service: the channel to its scrobble thread, the form fields
+/// and the state its card draws. One per [`SERVICES`] entry.
+pub(crate) struct Client {
+    /// Which service this client speaks to (endpoints, name, files).
+    pub(crate) service: &'static Service,
     cmd_tx: Sender<Command>,
-    rx: Receiver<LastFmStatus>,
+    rx: Receiver<Status>,
     /// Whether anything would actually be sent (a session exists and a toggle is on), kept in
     /// step with `conn` and the toggles so the media hub can ask without reading UI state.
     enabled: Arc<AtomicBool>,
     /// The connection state shown in the card.
     pub(crate) conn: Connection,
-    /// The pasted API key.
+    /// The pasted API key (Last.fm; hidden for a service with built-in credentials).
     pub(crate) key: TextEdit,
     /// The pasted shared secret (masked).
     pub(crate) secret: TextEdit,
@@ -682,15 +793,15 @@ pub(crate) struct LastFm {
     pub(crate) error: bool,
 }
 
-/// The handle another thread (the media hub) uses to follow playback with Last.fm: it forwards
-/// events to the scrobble thread and answers whether anything would be sent.
+/// The handle another thread (the media hub) uses to follow playback with one service: it
+/// forwards events to that service's scrobble thread and answers whether anything would be sent.
 #[derive(Clone)]
-pub(crate) struct LastFmSink {
+pub(crate) struct Sink {
     tx: Sender<Command>,
     enabled: Arc<AtomicBool>,
 }
 
-impl LastFmSink {
+impl Sink {
     /// Forwards one playback event to the scrobble thread. Never blocks.
     pub(crate) fn handle(&self, event: MediaEvent) {
         let _ = self.tx.send(Command::Media(event));
@@ -711,10 +822,10 @@ pub(crate) enum Connection {
     Connected { username: String },
 }
 
-impl LastFm {
-    /// Starts the scrobble thread, seeding the form from the saved store.
-    pub(crate) fn start(waker: Waker) -> LastFm {
-        let store = Store::load();
+impl Client {
+    /// Starts the service's scrobble thread, seeding the form from its saved store.
+    pub(crate) fn start(service: &'static Service, waker: Waker) -> Client {
+        let store = Store::load(service);
         let conn = if store.connected() {
             Connection::Connected { username: store.username.clone() }
         } else {
@@ -722,13 +833,13 @@ impl LastFm {
         };
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
-        let base = std::env::var("TSUN_LASTFM_API_BASE").unwrap_or_else(|_| API_BASE.to_owned());
         let prefs = (store.scrobble, store.now_playing, store.love);
         // The form starts from what was saved: the key and secret prefill, and the toggles show
         // their persisted state.
         let (key, secret) = (store.api_key.clone(), store.secret.clone());
-        thread::spawn(move || run(store, base, cmd_rx, status_tx, waker));
-        let lastfm = LastFm {
+        thread::spawn(move || run(service, store, cmd_rx, status_tx, waker));
+        let client = Client {
+            service,
             cmd_tx,
             rx: status_rx,
             enabled: Arc::new(AtomicBool::new(false)),
@@ -741,16 +852,16 @@ impl LastFm {
             message: None,
             error: false,
         };
-        lastfm.mark_enabled();
-        lastfm
+        client.mark_enabled();
+        client
     }
 
     /// The handle the media hub sends playback events through.
-    pub(crate) fn sink(&self) -> LastFmSink {
-        LastFmSink { tx: self.cmd_tx.clone(), enabled: Arc::clone(&self.enabled) }
+    pub(crate) fn sink(&self) -> Sink {
+        Sink { tx: self.cmd_tx.clone(), enabled: Arc::clone(&self.enabled) }
     }
 
-    /// Recomputes [`LastFmSink::enabled`] after the connection state or a toggle changed.
+    /// Recomputes [`Sink::enabled`] after the connection state or a toggle changed.
     fn mark_enabled(&self) {
         let on = matches!(self.conn, Connection::Connected { .. }) && (self.scrobble || self.now_playing);
         self.enabled.store(on, Ordering::Relaxed);
@@ -758,7 +869,7 @@ impl LastFm {
 
     /// A client for UI tests: the same state, but no thread, no filesystem and no network.
     #[cfg(test)]
-    pub(crate) fn for_test(store: &Store) -> LastFm {
+    pub(crate) fn for_test(service: &'static Service, store: &Store) -> Client {
         let (cmd_tx, _cmd_rx) = mpsc::channel();
         let (_status_tx, status_rx) = mpsc::channel();
         let conn = if store.connected() {
@@ -766,7 +877,8 @@ impl LastFm {
         } else {
             Connection::Disconnected
         };
-        let lastfm = LastFm {
+        let client = Client {
+            service,
             cmd_tx,
             rx: status_rx,
             enabled: Arc::new(AtomicBool::new(false)),
@@ -779,33 +891,34 @@ impl LastFm {
             message: None,
             error: false,
         };
-        lastfm.mark_enabled();
-        lastfm
+        client.mark_enabled();
+        client
     }
 
     /// Applies one status from the thread to the card's state. Returns whether it changed.
-    fn apply(&mut self, status: LastFmStatus) -> bool {
+    fn apply(&mut self, status: Status) -> bool {
+        let name = self.service.name;
         match status {
-            LastFmStatus::Disconnected => {
+            Status::Disconnected => {
                 self.conn = Connection::Disconnected;
-                self.message = Some("Disconnected from Last.fm".to_owned());
+                self.message = Some(format!("Disconnected from {name}"));
                 self.error = false;
             }
-            LastFmStatus::Authorizing { url } => {
+            Status::Authorizing { url } => {
                 self.conn = Connection::Authorizing { url };
                 self.message = Some("Authorize tsun in your browser, then confirm.".to_owned());
                 self.error = false;
             }
-            LastFmStatus::Connected { username } => {
+            Status::Connected { username } => {
                 self.conn = Connection::Connected { username };
-                self.message = Some("Connected to Last.fm".to_owned());
+                self.message = Some(format!("Connected to {name}"));
                 self.error = false;
             }
-            LastFmStatus::Error(message) => {
+            Status::Error(message) => {
                 self.message = Some(message);
                 self.error = true;
             }
-            LastFmStatus::Notice(message) => {
+            Status::Notice(message) => {
                 self.message = Some(message);
                 self.error = false;
             }
@@ -815,22 +928,28 @@ impl LastFm {
     }
 }
 
-/// The scrobble thread: owns the store, the tracker, the offline queue and the HTTP client.
-fn run(store: Store, base: String, cmd_rx: Receiver<Command>, tx: Sender<LastFmStatus>, waker: Waker) {
-    let api = Api::with_base(&base);
+/// The scrobble thread: owns the service's store, tracker, offline queue and HTTP client.
+fn run(
+    service: &'static Service,
+    store: Store,
+    cmd_rx: Receiver<Command>,
+    tx: Sender<Status>,
+    waker: Waker,
+) {
+    let api = Api::for_service(service);
     let mut store = store;
     // The official scrobble rule, unless a test asked for another one (see `Thresholds`).
     let mut tracker = Scrobbler::with_thresholds(Thresholds::from_env());
-    let mut queue = PendingQueue::load();
+    let mut queue = PendingQueue::load(service);
     let mut pending_token: Option<String> = None;
     let mut warned_retry = false;
-    let report = |status: LastFmStatus| {
+    let report = |status: Status| {
         let _ = tx.send(status);
         waker.as_ref()();
     };
     // Announce the restored state so the card matches the file.
     if store.connected() {
-        report(LastFmStatus::Connected { username: store.username.clone() });
+        report(Status::Connected { username: store.username.clone() });
     }
     // A queue left from an earlier run is retried as soon as the network allows.
     if store.connected() && !queue.is_empty() {
@@ -846,18 +965,21 @@ fn run(store: Store, base: String, cmd_rx: Receiver<Command>, tx: Sender<LastFmS
                         if store.now_playing && store.connected() {
                             if let Err(error) = api.update_now_playing(&store, &track) {
                                 if error.disposition() == ErrorDisposition::Drop {
-                                    report(LastFmStatus::Error(error.message()));
+                                    report(Status::Error(error.message()));
                                 }
                             }
                         }
                     }
                     if let Some(completed) = actions.scrobble {
                         if store.scrobble {
-                            queue.push(Scrobble {
-                                track: completed.track,
-                                at: completed.at,
-                                played_secs: completed.played_secs,
-                            });
+                            queue.push(
+                                Scrobble {
+                                    track: completed.track,
+                                    at: completed.at,
+                                    played_secs: completed.played_secs,
+                                },
+                                service,
+                            );
                         }
                     }
                     if store.connected() && queue.due(now) {
@@ -865,65 +987,66 @@ fn run(store: Store, base: String, cmd_rx: Receiver<Command>, tx: Sender<LastFmS
                     }
                 }
                 Command::Connect => {
-                    if !store.has_credentials() {
-                        report(LastFmStatus::Error("Enter your Last.fm API key and shared secret first".to_owned()));
+                    if !store.has_credentials(service) {
+                        report(Status::Error(format!(
+                            "Enter your {} API key and shared secret first",
+                            service.name
+                        )));
                         continue;
                     }
-                    match api.get_token(&store.api_key, &store.secret) {
+                    let (api_key, _) = store.credentials(service);
+                    match api.get_token(&store) {
                         Ok(token) => {
-                            let url = format!(
-                                "{AUTH_URL}?api_key={}&token={token}",
-                                urlencode(&store.api_key)
-                            );
+                            let url = format!("{}?api_key={}&token={token}", service.auth_url, urlencode(api_key));
                             pending_token = Some(token);
-                            report(LastFmStatus::Authorizing { url });
+                            report(Status::Authorizing { url });
                         }
-                        Err(error) => report(LastFmStatus::Error(error.message())),
+                        Err(error) => report(Status::Error(error.message())),
                     }
                 }
                 Command::ConfirmAuth => {
                     let Some(token) = pending_token.clone() else {
-                        report(LastFmStatus::Error("Press Connect first".to_owned()));
+                        report(Status::Error("Press Connect first".to_owned()));
                         continue;
                     };
-                    match api.get_session(&store.api_key, &store.secret, &token) {
+                    match api.get_session(&store, &token) {
                         Ok((key, name)) => {
                             store.session_key = key;
                             store.username = name.clone();
-                            store.save();
+                            store.save(service);
                             pending_token = None;
-                            report(LastFmStatus::Connected { username: name });
+                            report(Status::Connected { username: name });
                             let now = unix_secs();
                             if queue.due(now) {
                                 drain_queue(&api, &mut store, &mut queue, &report, &mut warned_retry);
                             }
                         }
-                        Err(error) => report(LastFmStatus::Error(error.message())),
+                        Err(error) => report(Status::Error(error.message())),
                     }
                 }
                 Command::Disconnect => {
                     store.session_key.clear();
                     store.username.clear();
-                    store.save();
+                    store.save(service);
                     pending_token = None;
-                    report(LastFmStatus::Disconnected);
+                    report(Status::Disconnected);
                 }
                 Command::SetCredentials { api_key, secret } => {
                     store.api_key = api_key;
                     store.secret = secret;
-                    store.save();
+                    store.save(service);
                 }
                 Command::SetPrefs { scrobble, now_playing, love } => {
                     store.scrobble = scrobble;
                     store.now_playing = now_playing;
                     store.love = love;
-                    store.save();
+                    store.save(service);
                 }
                 Command::Love { title, artist, on } => {
                     if store.love && store.connected() {
                         if let Err(error) = api.love(&store, &title, &artist, on) {
                             if error.disposition() == ErrorDisposition::Drop {
-                                report(LastFmStatus::Error(error.message()));
+                                report(Status::Error(error.message()));
                             }
                         }
                     }
@@ -945,21 +1068,22 @@ fn drain_queue(
     api: &Api,
     store: &mut Store,
     queue: &mut PendingQueue,
-    report: &impl Fn(LastFmStatus),
+    report: &impl Fn(Status),
     warned_retry: &mut bool,
 ) {
+    let name = api.service.name;
     let now = unix_secs();
     match queue.flush(api, store, now) {
         Ok(count) if count > 0 => {
             *warned_retry = false;
-            report(LastFmStatus::Notice(format!("Scrobbled {count} play(s) to Last.fm")));
+            report(Status::Notice(format!("Scrobbled {count} play(s) to {name}")));
         }
         Ok(_) => {}
         Err(_) => {
             if !*warned_retry {
                 *warned_retry = true;
-                report(LastFmStatus::Notice(format!(
-                    "{} play(s) will be scrobbled when Last.fm is reachable again",
+                report(Status::Notice(format!(
+                    "{} play(s) will be scrobbled when {name} is reachable again",
                     queue.len()
                 )));
             }
@@ -992,87 +1116,100 @@ fn unix_secs() -> f64 {
 // UI integration
 
 impl Ui {
-    /// Drains the scrobble thread's statuses into the card's state. Called from `poll`.
-    pub(crate) fn poll_lastfm(&mut self) -> bool {
-        let Some(lastfm) = &mut self.lastfm else { return false };
+    /// The client for `service`, when it is running.
+    pub(crate) fn scrobble_client(&self, service: &'static Service) -> Option<&Client> {
+        self.scrobbling.iter().find(|client| client.service.id == service.id)
+    }
+
+    /// The mutable client for `service`, when it is running.
+    pub(crate) fn scrobble_client_mut(&mut self, service: &'static Service) -> Option<&mut Client> {
+        self.scrobbling.iter_mut().find(|client| client.service.id == service.id)
+    }
+
+    /// Drains every scrobble thread's statuses into its card's state. Called from `poll`.
+    pub(crate) fn poll_scrobbling(&mut self) -> bool {
         let mut changed = false;
-        loop {
-            match lastfm.rx.try_recv() {
-                Ok(status) => {
-                    changed |= lastfm.apply(status);
+        for client in &mut self.scrobbling {
+            loop {
+                match client.rx.try_recv() {
+                    Ok(status) => changed |= client.apply(status),
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
             }
         }
         changed
     }
 
-    /// Sends the pasted API key and secret to the thread.
-    pub(crate) fn lastfm_save_credentials(&mut self) {
-        let Some(lastfm) = &self.lastfm else { return };
-        let _ = lastfm.cmd_tx.send(Command::SetCredentials {
-            api_key: lastfm.key.text.trim().to_owned(),
-            secret: lastfm.secret.text.trim().to_owned(),
-        });
+    /// Sends the pasted API key and secret to the service's thread.
+    pub(crate) fn scrobble_save_credentials(&mut self, service: &'static Service) {
+        let Some(client) = self.scrobble_client(service) else { return };
+        let api_key = client.key.text.trim().to_owned();
+        let secret = client.secret.text.trim().to_owned();
+        let _ = client.cmd_tx.send(Command::SetCredentials { api_key, secret });
     }
 
     /// Starts the authorization flow (fetch a token, then let the user open the URL).
-    pub(crate) fn lastfm_connect(&mut self) {
-        self.lastfm_save_credentials();
-        if let Some(lastfm) = &mut self.lastfm {
-            lastfm.message = Some("Contacting Last.fm…".to_owned());
-            lastfm.error = false;
-            let _ = lastfm.cmd_tx.send(Command::Connect);
+    pub(crate) fn scrobble_connect(&mut self, service: &'static Service) {
+        self.scrobble_save_credentials(service);
+        if let Some(client) = self.scrobble_client_mut(service) {
+            client.message = Some(format!("Contacting {}…", service.name));
+            client.error = false;
+            let _ = client.cmd_tx.send(Command::Connect);
         }
     }
 
     /// Completes the authorization after the user approved the token.
-    pub(crate) fn lastfm_confirm(&mut self) {
-        if let Some(lastfm) = &mut self.lastfm {
-            lastfm.message = Some("Finishing sign-in…".to_owned());
-            lastfm.error = false;
-            let _ = lastfm.cmd_tx.send(Command::ConfirmAuth);
+    pub(crate) fn scrobble_confirm(&mut self, service: &'static Service) {
+        if let Some(client) = self.scrobble_client_mut(service) {
+            client.message = Some("Finishing sign-in…".to_owned());
+            client.error = false;
+            let _ = client.cmd_tx.send(Command::ConfirmAuth);
         }
     }
 
-    /// Forgets the session key while keeping the API key and secret.
-    pub(crate) fn lastfm_disconnect(&mut self) {
-        if let Some(lastfm) = &self.lastfm {
-            let _ = lastfm.cmd_tx.send(Command::Disconnect);
+    /// Forgets the session key while keeping whatever credentials the service uses.
+    pub(crate) fn scrobble_disconnect(&mut self, service: &'static Service) {
+        if let Some(client) = self.scrobble_client(service) {
+            let _ = client.cmd_tx.send(Command::Disconnect);
         }
     }
 
-    /// Flips one of the three Last.fm toggles and pushes the change to the thread.
-    pub(crate) fn lastfm_set_pref(&mut self, which: LastFmPref) {
-        let Some(lastfm) = &mut self.lastfm else { return };
+    /// Flips one of a service's three toggles and pushes the change to its thread.
+    pub(crate) fn scrobble_set_pref(&mut self, service: &'static Service, which: Pref) {
+        let Some(client) = self.scrobble_client_mut(service) else { return };
         match which {
-            LastFmPref::Scrobble => lastfm.scrobble = !lastfm.scrobble,
-            LastFmPref::NowPlaying => lastfm.now_playing = !lastfm.now_playing,
-            LastFmPref::Love => lastfm.love = !lastfm.love,
+            Pref::Scrobble => client.scrobble = !client.scrobble,
+            Pref::NowPlaying => client.now_playing = !client.now_playing,
+            Pref::Love => client.love = !client.love,
         }
-        lastfm.mark_enabled();
+        client.mark_enabled();
         let command = Command::SetPrefs {
-            scrobble: lastfm.scrobble,
-            now_playing: lastfm.now_playing,
-            love: lastfm.love,
+            scrobble: client.scrobble,
+            now_playing: client.now_playing,
+            love: client.love,
         };
-        let _ = lastfm.cmd_tx.send(command);
+        let _ = client.cmd_tx.send(command);
     }
 
-    /// Mirrors a TIDAL favourite onto Last.fm (love/unlove), when the toggle is on. Only called
-    /// for TIDAL tracks: a local file is never a TIDAL favourite and carries no Last.fm love.
-    pub(crate) fn lastfm_love(&mut self, track_id: u64, on: bool) {
-        // Local files are never TIDAL favourites and have no Last.fm love of their own.
+    /// Mirrors a TIDAL favourite onto every connected service that has the love switch on. Only
+    /// called for TIDAL tracks: a local file is never a TIDAL favourite and has no love of its
+    /// own.
+    pub(crate) fn scrobble_love(&mut self, track_id: u64, on: bool) {
+        // Local files are never TIDAL favourites and have no love of their own.
         if crate::local::is_local_id(track_id) {
             return;
         }
-        let Some(lastfm) = &self.lastfm else { return };
-        if !lastfm.love || !matches!(lastfm.conn, Connection::Connected { .. }) {
-            return;
-        }
         let Some((title, artist)) = self.track_artist_title(track_id) else { return };
-        let _ = lastfm.cmd_tx.send(Command::Love { title, artist, on });
+        for client in &self.scrobbling {
+            if !client.love || !matches!(client.conn, Connection::Connected { .. }) {
+                continue;
+            }
+            let _ = client.cmd_tx.send(Command::Love {
+                title: title.clone(),
+                artist: artist.clone(),
+                on,
+            });
+        }
     }
 
     /// The title and artist of a TIDAL track by id, from whatever list holds it.
@@ -1102,9 +1239,9 @@ impl Ui {
     }
 }
 
-/// One of the Last.fm toggles.
+/// One of a service's three toggles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LastFmPref {
+pub(crate) enum Pref {
     Scrobble,
     NowPlaying,
     Love,
@@ -1489,18 +1626,13 @@ pub(crate) mod tests {
             (200, r##"{"nowplaying":{"artist":{"#text":"A"}}}"##.to_owned()),
             (200, r#"{"scrobbles":{"@attr":{"accepted":2,"ignored":0}}}"#.to_owned()),
         ]);
-        let api = Api::with_base(&mock.base);
-        let token = api.get_token("key", "sec").unwrap();
+        let api = Api::with_base(&LASTFM, &mock.base);
+        let store = Store { api_key: "key".into(), secret: "sec".into(), ..Store::default() };
+        let token = api.get_token(&store).unwrap();
         assert_eq!(token, "TOK");
-        let (session, name) = api.get_session("key", "sec", &token).unwrap();
+        let (session, name) = api.get_session(&store, &token).unwrap();
         assert_eq!((session.as_str(), name.as_str()), ("SESS", "tester"));
-        let store = Store {
-            api_key: "key".into(),
-            secret: "sec".into(),
-            session_key: session.clone(),
-            username: name.clone(),
-            ..Store::default()
-        };
+        let store = Store { session_key: session.clone(), username: name.clone(), ..store };
         api.update_now_playing(&store, &track("T", "A", Some(120))).unwrap();
         let batch = vec![
             Scrobble { track: track("T1", "A", Some(120)), at: 100, played_secs: 90.0 },
@@ -1522,10 +1654,10 @@ pub(crate) mod tests {
             (500, "server error".to_owned()),
             (200, r#"{"scrobbles":{"@attr":{"accepted":1,"ignored":0}}}"#.to_owned()),
         ]);
-        let api = Api::with_base(&mock.base);
+        let api = Api::with_base(&LASTFM, &mock.base);
         let store = Store { api_key: "k".into(), secret: "s".into(), session_key: "sk".into(), ..Store::default() };
         let mut queue = PendingQueue { entries: Vec::new(), failures: 0, next_attempt: None };
-        queue.push(Scrobble { track: track("T", "A", Some(120)), at: 100, played_secs: 90.0 });
+        queue.push(Scrobble { track: track("T", "A", Some(120)), at: 100, played_secs: 90.0 }, &LASTFM);
 
         // First attempt: the mock answers 500, so the play stays and the backoff is armed.
         let error = queue.flush(&api, &store, 10.0).unwrap_err();
@@ -1542,12 +1674,385 @@ pub(crate) mod tests {
     #[test]
     fn the_queue_drops_a_permanently_invalid_play() {
         let mock = Mock::start(vec![(200, r#"{"error":6,"message":"Invalid parameters"}"#.to_owned())]);
-        let api = Api::with_base(&mock.base);
+        let api = Api::with_base(&LASTFM, &mock.base);
         let store = Store { api_key: "k".into(), secret: "s".into(), session_key: "sk".into(), ..Store::default() };
         let mut queue = PendingQueue { entries: Vec::new(), failures: 0, next_attempt: None };
-        queue.push(Scrobble { track: track("T", "A", Some(120)), at: 100, played_secs: 90.0 });
+        queue.push(Scrobble { track: track("T", "A", Some(120)), at: 100, played_secs: 90.0 }, &LASTFM);
         // The single entry is retried on its own and, still invalid, dropped.
         assert!(queue.flush(&api, &store, 0.0).is_ok());
         assert!(queue.is_empty());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Two services side by side
+
+    /// A scratch `XDG_CONFIG_HOME` plus the service environment, for tests that start real
+    /// clients. The config lock is held for as long as the variables are set (they are
+    /// process-wide), and everything is restored and removed on drop.
+    struct ScratchEnv {
+        previous: Option<std::ffi::OsString>,
+        dir: PathBuf,
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        /// Declared last so the lock is held until the variables are restored (fields drop in
+        /// declaration order, and `Drop` runs before them).
+        _turn: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchEnv {
+        fn new(name: &str, vars: &[(&'static str, String)]) -> ScratchEnv {
+            let turn = crate::settings::lock_config_env();
+            let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "tsun-scrobble-{}-{name}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(dir.join("tsun")).unwrap();
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            // SAFETY: the config lock is held, so no other test reads these variables.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+            let mut saved = Vec::new();
+            for (name, value) in vars {
+                saved.push((*name, std::env::var_os(name)));
+                unsafe { std::env::set_var(name, value) };
+            }
+            ScratchEnv { previous, dir, vars: saved, _turn: turn }
+        }
+
+        fn write(&self, file: &str, contents: &str) {
+            fs::write(self.dir.join("tsun").join(file), contents).unwrap();
+        }
+
+        fn config_file(&self, file: &str) -> PathBuf {
+            self.dir.join("tsun").join(file)
+        }
+
+        fn exists(&self, file: &str) -> bool {
+            self.config_file(file).exists()
+        }
+    }
+
+    impl Drop for ScratchEnv {
+        fn drop(&mut self) {
+            // SAFETY: the config lock is still held (see the field order).
+            unsafe {
+                for (name, value) in &self.vars {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+                match &self.previous {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The `method` of every request a mock received, in order.
+    fn methods(mock: &Mock) -> Vec<String> {
+        mock.requests()
+            .iter()
+            .filter_map(|params| param_of(params, "method"))
+            .collect()
+    }
+
+    fn param_of(params: &[(String, String)], name: &str) -> Option<String> {
+        params.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone())
+    }
+
+    /// Waits for `condition`, polling: the scrobble threads work asynchronously.
+    fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        condition()
+    }
+
+    fn test_waker() -> Waker {
+        Arc::new(|| {})
+    }
+
+    #[test]
+    fn each_service_keeps_its_own_files_and_old_files_load_with_defaults() {
+        let env = ScratchEnv::new("files", &[]);
+        // The two services never share a file, so connecting one cannot disturb the other.
+        assert_ne!(LASTFM.store_file, SCROBBLENOW.store_file);
+        assert_ne!(LASTFM.queue_file, SCROBBLENOW.queue_file);
+        assert_ne!(LASTFM.api_base, SCROBBLENOW.api_base);
+        assert_ne!(LASTFM.api_base_env, SCROBBLENOW.api_base_env);
+        assert!(LASTFM.builtin.is_none(), "Last.fm asks the user for a key");
+        assert!(SCROBBLENOW.builtin.is_some(), "scrobble.now ships one");
+
+        // A Last.fm file written before the switches existed keeps loading exactly as it did:
+        // the credentials and session it carries, the same defaults for the rest.
+        env.write(
+            LASTFM.store_file,
+            r#"{"api_key":"oldkey","secret":"oldsecret","session_key":"OLDSESS","username":"oldlistener"}"#,
+        );
+        let legacy = Store::load(&LASTFM);
+        assert_eq!(
+            (legacy.api_key.as_str(), legacy.session_key.as_str(), legacy.username.as_str()),
+            ("oldkey", "OLDSESS", "oldlistener"),
+            "the credentials an old file carries are kept"
+        );
+        assert!(legacy.scrobble && legacy.now_playing && !legacy.love, "and the defaults fill the rest");
+        assert!(legacy.has_credentials(&LASTFM));
+        assert_eq!(legacy.credentials(&LASTFM), ("oldkey", "oldsecret"));
+
+        // A scrobble.now file written before the switches existed loads the same way.
+        env.write(SCROBBLENOW.store_file, r#"{"session_key":"S","username":"late"}"#);
+        let store = Store::load(&SCROBBLENOW);
+        assert_eq!(store.username, "late");
+        assert!(store.scrobble && store.now_playing, "the defaults send both");
+        assert!(!store.love, "loving is off by default");
+
+        // The credentials are the service's own: scrobble.now signs with tsun's built-in pair
+        // whatever an old file may hold, Last.fm uses what the user pasted.
+        assert_eq!(store.credentials(&SCROBBLENOW), ("tsun", SCROBBLENOW.builtin.unwrap().secret));
+        assert!(store.has_credentials(&SCROBBLENOW), "no key to paste for scrobble.now");
+
+        // `settings.json` is not involved at all, so any file from an earlier tsun loads: the
+        // scrobbling switches live beside each service's session, never in it.
+        assert!(!fs::read_to_string(env.config_file("settings.json")).unwrap_or_default().contains("scrobble"));
+
+        // Saving one service writes its own file only.
+        let lastfm_before = fs::read_to_string(env.config_file(LASTFM.store_file)).unwrap();
+        Store { username: "saved".to_owned(), ..store }.save(&SCROBBLENOW);
+        assert!(env.exists(SCROBBLENOW.store_file));
+        assert_eq!(
+            fs::read_to_string(env.config_file(LASTFM.store_file)).unwrap(),
+            lastfm_before,
+            "Last.fm's file is untouched"
+        );
+        assert_eq!(Store::load(&SCROBBLENOW).username, "saved");
+
+        // The offline queue is per service too.
+        let mut queue = PendingQueue::default();
+        queue.push(
+            Scrobble { track: track("T", "A", Some(120)), at: 100, played_secs: 90.0 },
+            &SCROBBLENOW,
+        );
+        assert!(env.exists(SCROBBLENOW.queue_file));
+        assert!(!env.exists(LASTFM.queue_file), "Last.fm's queue is untouched");
+        let text = fs::read_to_string(env.config_file(SCROBBLENOW.queue_file)).unwrap();
+        assert!(text.contains("\"T\""), "{text}");
+    }
+
+    /// The scrobble.now flow end to end against a mock: getToken, getSession (username), then
+    /// now-playing and a scrobble — all at the scrobble.now base, with tsun's own key, and with
+    /// the session landing in `scrobblenow.json` and the queue in `scrobblenow_queue.json`.
+    #[test]
+    fn a_scrobblenow_client_authorizes_and_scrobbles_through_its_own_base() {
+        let mock = Mock::start(vec![
+            (200, r#"{"token":"TOKNOW"}"#.to_owned()),
+            (200, r#"{"session":{"name":"nowlistener","key":"SESSNOW","subscriber":"1"}}"#.to_owned()),
+            (200, r#"{"nowplaying":{}}"#.to_owned()),
+            (200, r#"{"scrobbles":{"@attr":{"accepted":1,"ignored":0}}}"#.to_owned()),
+        ]);
+        let env = ScratchEnv::new(
+            "scrobblenow",
+            &[
+                (SCROBBLENOW.api_base_env, mock.base.clone()),
+                ("TSUN_SCROBBLE_MIN_TRACK_SECS", "0".to_owned()),
+                ("TSUN_SCROBBLE_MIN_PLAYED_SECS", "0".to_owned()),
+            ],
+        );
+        assert!(SCROBBLENOW.api_base.starts_with("https://scrobble.now/2.0/"));
+        let client = Client::start(&SCROBBLENOW, test_waker());
+        assert!(matches!(client.conn, Connection::Disconnected));
+
+        // Connect: no credentials are asked for, and the token comes back from the mock.
+        let _ = client.cmd_tx.send(Command::Connect);
+        let status = client.rx.recv_timeout(Duration::from_secs(10)).expect("an authorization URL");
+        let Status::Authorizing { url } = status else { panic!("expected authorization, got {status:?}") };
+        assert_eq!(url, "https://scrobble.now/api/auth/?api_key=tsun&token=TOKNOW");
+
+        // Confirm: the session's username is parsed and the store file is scrobble.now's.
+        let _ = client.cmd_tx.send(Command::ConfirmAuth);
+        let connected = wait_for_status(&client, |status| {
+            matches!(status, Status::Connected { username } if username == "nowlistener")
+        });
+        assert!(connected, "the session was not accepted");
+        assert!(env.exists(SCROBBLENOW.store_file), "the session is saved in scrobblenow.json");
+        assert!(!env.exists(LASTFM.store_file), "Last.fm's file is untouched");
+        let saved = fs::read_to_string(env.config_file(SCROBBLENOW.store_file)).unwrap();
+        assert!(saved.contains("SESSNOW") && saved.contains("nowlistener"), "{saved}");
+
+        // Playback: one now-playing, then one scrobble, both at the scrobble.now base.
+        let media = MediaEvent::Started { track: track("T", "A", Some(120)), position_secs: 0.0 };
+        let _ = client.cmd_tx.send(Command::Media(media));
+        let _ = client.cmd_tx.send(Command::Media(MediaEvent::Finished));
+        let sent = || methods(&mock);
+        assert!(
+            wait_until(|| {
+                let seen = sent();
+                seen.contains(&"track.updateNowPlaying".to_owned())
+                    && seen.contains(&"track.scrobble".to_owned())
+            }),
+            "the mock received {:?}",
+            sent()
+        );
+        let requests = mock.requests();
+        assert_eq!(
+            methods(&mock),
+            [
+                "auth.getToken",
+                "auth.getSession",
+                "track.updateNowPlaying",
+                "track.scrobble"
+            ],
+            "the requests went to the mock, in the Last.fm protocol's order"
+        );
+        // tsun's own key signs every request, and the session key is carried once connected.
+        assert_eq!(param_of(&requests[0], "api_key").as_deref(), Some("tsun"));
+        assert_eq!(
+            param_of(&requests[0], "api_sig"),
+            Some(api_sig(&requests[0], SCROBBLENOW.builtin.unwrap().secret)),
+            "the token request is signed with tsun's own secret"
+        );
+        assert_eq!(param_of(&requests[3], "sk").as_deref(), Some("SESSNOW"));
+        assert_eq!(param_of(&requests[3], "artist[0]").as_deref(), Some("A"));
+    }
+
+    /// Both services follow one track through the media hub: each gets one now-playing and one
+    /// scrobble, a favourite reaches both, and turning one service's switches off stops only it.
+    #[test]
+    fn both_services_follow_playback_and_only_the_one_switched_off_stops() {
+        let lastfm_mock = Mock::repeating(10, r#"{"nowplaying":{}}"#.to_owned());
+        let now_mock =
+            Mock::repeating(12, r#"{"scrobbles":{"@attr":{"accepted":1,"ignored":0}}}"#.to_owned());
+        let env = ScratchEnv::new(
+            "both",
+            &[
+                (LASTFM.api_base_env, lastfm_mock.base.clone()),
+                (SCROBBLENOW.api_base_env, now_mock.base.clone()),
+                ("TSUN_SCROBBLE_MIN_TRACK_SECS", "0".to_owned()),
+                ("TSUN_SCROBBLE_MIN_PLAYED_SECS", "0".to_owned()),
+            ],
+        );
+        // Both stores connected, with the love switch on, so a heart mirrors to both.
+        for service in [&LASTFM, &SCROBBLENOW] {
+            env.write(
+                service.store_file,
+                r#"{"api_key":"key","secret":"secret","session_key":"SESS","username":"listener","scrobble":true,"now_playing":true,"love":true}"#,
+            );
+        }
+        let mut ui = crate::app::init();
+        ui.scrobbling = vec![
+            Client::start(&LASTFM, test_waker()),
+            Client::start(&SCROBBLENOW, test_waker()),
+        ];
+        let hub = crate::media_hub::MediaHub::new();
+        hub.set_scrobbling(ui.scrobbling.iter().map(Client::sink).collect());
+
+        // One track, played to its end: one now-playing and one scrobble to each service.
+        let first = track("T", "A", Some(120));
+        ui.now_playing = Some(now_playing(42, &first));
+        hub.dispatch_now(MediaEvent::Started { track: first.clone(), position_secs: 0.0 });
+        hub.dispatch_now(MediaEvent::Finished);
+        assert!(
+            wait_until(|| {
+                methods(&lastfm_mock).len() >= 2 && methods(&now_mock).len() >= 2
+            }),
+            "Last.fm: {:?}, scrobble.now: {:?}",
+            methods(&lastfm_mock),
+            methods(&now_mock)
+        );
+        for name in [&lastfm_mock, &now_mock] {
+            let seen = methods(name);
+            assert_eq!(
+                seen.iter().filter(|method| *method == "track.updateNowPlaying").count(),
+                1,
+                "exactly one now-playing: {seen:?}"
+            );
+            assert_eq!(
+                seen.iter().filter(|method| *method == "track.scrobble").count(),
+                1,
+                "exactly one scrobble: {seen:?}"
+            );
+        }
+
+        // A TIDAL favourite mirrors to both services.
+        ui.scrobble_love(42, true);
+        assert!(
+            wait_until(|| {
+                methods(&lastfm_mock).contains(&"track.love".to_owned())
+                    && methods(&now_mock).contains(&"track.love".to_owned())
+            }),
+            "Last.fm: {:?}, scrobble.now: {:?}",
+            methods(&lastfm_mock),
+            methods(&now_mock)
+        );
+
+        // Switch Last.fm's sending off: its thread stops, scrobble.now's carries on.
+        let lastfm_before = methods(&lastfm_mock).len();
+        ui.scrobble_set_pref(&LASTFM, Pref::Scrobble);
+        ui.scrobble_set_pref(&LASTFM, Pref::Love);
+        ui.scrobble_set_pref(&LASTFM, Pref::NowPlaying);
+        let second = track("T2", "B", Some(180));
+        ui.now_playing = Some(now_playing(43, &second));
+        hub.dispatch_now(MediaEvent::Started { track: second.clone(), position_secs: 0.0 });
+        hub.dispatch_now(MediaEvent::Finished);
+        ui.scrobble_love(43, true);
+        assert!(
+            wait_until(|| {
+                let seen = methods(&now_mock);
+                seen.iter().filter(|method| *method == "track.scrobble").count() >= 2
+                    && seen.iter().filter(|method| *method == "track.love").count() >= 2
+            }),
+            "scrobble.now: {:?}",
+            methods(&now_mock)
+        );
+        // A moment for anything the other thread was still going to send.
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            methods(&lastfm_mock).len(),
+            lastfm_before,
+            "Last.fm sent nothing after its switches were turned off: {:?}",
+            methods(&lastfm_mock)
+        );
+        // The stores record each service's own switches, so the choice survives a restart.
+        let lastfm_store = Store::load(&LASTFM);
+        let now_store = Store::load(&SCROBBLENOW);
+        assert!(!lastfm_store.scrobble && !lastfm_store.now_playing && !lastfm_store.love);
+        assert!(now_store.scrobble && now_store.now_playing && now_store.love);
+    }
+
+    fn now_playing(id: u64, track: &MediaTrack) -> crate::app::NowPlaying {
+        crate::app::NowPlaying {
+            id,
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            cover: None,
+            album_id: None,
+            artist_id: None,
+            elapsed: 0,
+            duration: track.duration_secs,
+            quality: None,
+            output: None,
+        }
+    }
+
+    /// Drains `client`'s statuses until `wanted` matches (or the timeout passes).
+    fn wait_for_status(client: &Client, wanted: impl Fn(&Status) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match client.rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(status) => {
+                    if wanted(&status) {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        false
     }
 }
